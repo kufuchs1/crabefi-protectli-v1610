@@ -1,0 +1,77 @@
+name: v1610-firmware
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+
+jobs:
+  rom:
+    runs-on: VPS
+    timeout-minutes: 60
+    container:
+      # deliberately unpinned: always build with the newest SDK
+      image: docker.io/coreboot/coreboot-sdk:testing
+      # SDK image defaults to USER coreboot; apt needs root.
+      options: --user root
+    env:
+      XGCCPATH: /opt/xgcc/bin/
+      COREBOOT_SDK_IMAGE: docker.io/coreboot/coreboot-sdk:testing
+    steps:
+      - name: bootstrap node for JS actions
+        run: |
+          apt-get -qq update
+          apt-get -qqy install --no-install-recommends curl ca-certificates git
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get -qqy install --no-install-recommends nodejs
+
+      - uses: https://code.forgejo.org/actions/checkout@v7
+
+      - name: build deps
+        run: |
+          apt-get -qqy install --no-install-recommends \
+            make gcc libc6-dev flex bison python3 openssl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: fetch blobs
+        env:
+          BLOB_TOKEN: ${{ secrets.BLOB_TOKEN }}
+        run: ./build.sh fetch-blobs
+
+      - name: check dependencies + Secure Boot keys
+        run: ./build.sh check
+
+      - name: build CrabEFI ROM
+        run: ./build.sh rom
+
+      - name: security test suites
+        run: ./build.sh test
+
+      - name: checksums to summary
+        if: always()
+        run: cat out/checksums-crabefi.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: stage release files
+        run: ./build.sh stage
+
+      - name: upload artifact (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: https://code.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: v1610-crabefi-${{ github.sha }}
+          path: release/
+
+      - name: create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: https://code.forgejo.org/actions/forgejo-release@v2
+        with:
+          direction: upload
+          tag: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release-dir: release
+          release-notes: "V1610 firmware ${{ github.ref_name }}: coreboot + CrabEFI, Secure Boot locked to the secureblue keys"

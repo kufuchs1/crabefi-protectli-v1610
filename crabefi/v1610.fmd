@@ -1,0 +1,19 @@
+# Flash layout for the CrabEFI ROM (16 MiB, CSE region shrunk to 1532 KiB).
+#
+# SI_DESC/SI_ME match the descriptor in blobs/descriptor.bin (FLREG0/FLREG2);
+# BIOS matches FLREG1 and is the region coreboot write-protects with
+# BOOTMEDIA_LOCK_CONTROLLER + BOOTMEDIA_LOCK_WHOLE_RO before the payload runs.
+#
+# RO_UEFI_VARS holds the pre-provisioned EDK2 variable store (PK, KEK, db,
+# SecureBootEnable=1) that build.sh writes after coreboot links the image.
+# The payload only ever reads it through the memory-mapped flash window.
+FLASH 0x1000000 {
+	SI_DESC@0x0 0x1000
+	SI_ME@0x1000 0x17f000
+	BIOS@0x180000 0xe80000 {
+		RW_MRC_CACHE@0x0 0x10000
+		RO_UEFI_VARS@0x10000 0x10000
+		FMAP@0x20000 0x1000
+		COREBOOT(CBFS)@0x21000 0xe5f000
+	}
+}

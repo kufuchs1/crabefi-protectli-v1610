@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    runs-on: VPS
+    container:
+      image: code.forgejo.org/oci/node:20-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v7
+
+      - name: shellcheck
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq shellcheck
+          shellcheck build.sh tools/*.sh
+          for f in build.sh tools/*.sh; do bash -n "$f"; done
+
+  configs:
+    runs-on: VPS
+    timeout-minutes: 15
+    container:
+      image: code.forgejo.org/oci/node:20-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v7
+
+      - name: kconfig deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            git make gcc flex bison python3 ca-certificates
+
+      - name: coreboot.txt against current coreboot main
+        run: ./build.sh configs
+
+  crabefi:
+    runs-on: VPS
+    timeout-minutes: 30
+    container:
+      image: code.forgejo.org/oci/node:20-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v7
+
+      - name: deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            git gcc libc6-dev python3 openssl curl ca-certificates
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: CrabEFI payload + variable store
+        run: ./build.sh payload
+
+      - name: security test suites
+        run: ./build.sh test

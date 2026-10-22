@@ -1,0 +1,615 @@
+From 4b03cd559a01543b6b687f78d86836f79470eac8 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Sun, 18 Oct 2026 17:25:57 +0000
+Subject: [PATCH] auth: enforce certificate constraints for Secure Boot
+
+---
+ crabefi-core/src/efi/auth/authenticode.rs     |  45 ++++
+ crabefi-core/src/efi/auth/crypto.rs           | 194 ++++++++++++++++--
+ .../src/efi/auth/testdata/security-badku.der  | Bin 0 -> 755 bytes
+ .../src/efi/auth/testdata/security-badku.p7   | Bin 0 -> 1375 bytes
+ .../efi/auth/testdata/security-critical.der   | Bin 0 -> 801 bytes
+ .../src/efi/auth/testdata/security-eku.der    | Bin 0 -> 806 bytes
+ .../src/efi/auth/testdata/security-eku.p7     | Bin 0 -> 1425 bytes
+ .../auth/testdata/security-intermediate.der   | Bin 0 -> 797 bytes
+ .../src/efi/auth/testdata/security-leaf.der   | Bin 0 -> 784 bytes
+ .../src/efi/auth/testdata/security-leaf.p7    | Bin 0 -> 1404 bytes
+ .../src/efi/auth/testdata/security-root.der   | Bin 0 -> 756 bytes
+ .../src/efi/auth/testdata/security-subca.der  | Bin 0 -> 795 bytes
+ 12 files changed, 220 insertions(+), 19 deletions(-)
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-badku.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-badku.p7
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-critical.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-eku.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-eku.p7
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-intermediate.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-leaf.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-leaf.p7
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-root.der
+ create mode 100644 crabefi-core/src/efi/auth/testdata/security-subca.der
+
+diff --git a/crabefi-core/src/efi/auth/authenticode.rs b/crabefi-core/src/efi/auth/authenticode.rs
+index 9ebc9d5..1f504d7 100644
+--- a/crabefi-core/src/efi/auth/authenticode.rs
++++ b/crabefi-core/src/efi/auth/authenticode.rs
+@@ -569,6 +569,51 @@ fn verify_authenticode_signature(
+ mod tests {
+     use super::*;
+ 
++    /// Exercise the production verifier with an independently supplied real EFI
++    /// binary. Run alone: this test owns the process-global db and dbx caches.
++    #[cfg(feature = "secure-boot")]
++    #[test]
++    #[ignore = "set CRABEFI_TEST_IMAGE and CRABEFI_TEST_CERT (DER), run with --ignored --test-threads=1"]
++    fn security_external_signed_image_and_tampering() {
++        use crate::efi::auth::{KeyDatabaseEntry, db_database, dbx_database};
++        use crabefi_efi_types::secure_boot::EFI_CERT_X509_GUID;
++        let mut image = std::fs::read(std::env::var("CRABEFI_TEST_IMAGE").unwrap()).unwrap();
++        let cert = std::fs::read(std::env::var("CRABEFI_TEST_CERT").unwrap()).unwrap();
++        dbx_database().clear();
++        db_database().clear();
++        // An untrusted signed image must not boot.
++        assert_eq!(verify_pe_image_secure_boot(&image), Ok(false));
++        db_database()
++            .add_entry(KeyDatabaseEntry {
++                cert_type: EFI_CERT_X509_GUID,
++                data: cert.clone(),
++                owner: [0; 16],
++            })
++            .unwrap();
++        assert_eq!(verify_pe_image_secure_boot(&image), Ok(true));
++        let info = parse_pe_for_hash(&image).unwrap();
++        let at = info
++            .sections
++            .iter()
++            .find(|s| s.size_of_raw_data != 0)
++            .unwrap()
++            .file_offset as usize;
++        image[at] ^= 1;
++        assert_ne!(verify_pe_image_secure_boot(&image), Ok(true));
++        image[at] ^= 1;
++        // dbx takes precedence over an enrolled db signer.
++        dbx_database()
++            .add_entry(KeyDatabaseEntry {
++                cert_type: EFI_CERT_X509_GUID,
++                data: cert,
++                owner: [0; 16],
++            })
++            .unwrap();
++        assert_eq!(verify_pe_image_secure_boot(&image), Ok(false));
++        db_database().clear();
++        dbx_database().clear();
++    }
++
+     #[test]
+     fn test_parse_pe_magic() {
+         // Minimal invalid PE
+diff --git a/crabefi-core/src/efi/auth/crypto.rs b/crabefi-core/src/efi/auth/crypto.rs
+index dfbb4a4..bca9ea2 100644
+--- a/crabefi-core/src/efi/auth/crypto.rs
++++ b/crabefi-core/src/efi/auth/crypto.rs
+@@ -250,6 +250,13 @@ pub fn verify_pkcs7_signature_chain(
+             continue;
+         };
+         let signer_cert = parse_cert_view(signer_der)?;
++        // A valid RSA signature is insufficient when the certificate
++        // explicitly prohibits digital signatures (e.g. a CA-only key).
++        if validate_certificate_policy(signer_der).is_err()
++            || validate_key_usage_for_code_signing(signer_der).is_err()
++        {
++            continue;
++        }
+         let signer_rsa_key = rsa_public_key(&signer_cert)?;
+ 
+         // The signature covers the signed attributes when present, otherwise
+@@ -406,6 +413,7 @@ pub fn build_and_verify_chain(
+         config,
+     ) {
+         Ok(()) => {
++            validate_path_lengths(&chain)?;
+             // Chain building succeeded
+             log::info!(
+                 "Successfully built certificate chain with {} certificates",
+@@ -422,6 +430,30 @@ pub fn build_and_verify_chain(
+     }
+ }
+ 
++/// Enforce each intermediate's delegation limit on the completed path.
++/// RFC 5280 counts non-self-issued CA certificates below that intermediate,
++/// excluding the end entity. Explicitly enrolled anchors are not constrained
++/// by their certificate extensions, matching Secure Boot's flat db trust.
++fn validate_path_lengths(chain: &[Vec<u8>]) -> Result<(), AuthError> {
++    for issuer_index in 1..chain.len().saturating_sub(1) {
++        if let Some(constraints) = extract_basic_constraints(&chain[issuer_index])?
++            && let Some(limit) = constraints.path_len
++        {
++            let mut subordinate_cas = 0usize;
++            for subordinate in &chain[1..issuer_index] {
++                let cert = parse_cert_view(subordinate)?;
++                if cert.subject != cert.issuer {
++                    subordinate_cas += 1;
++                }
++            }
++            if subordinate_cas > usize::from(limit) {
++                return Err(AuthError::ChainTooDeep);
++            }
++        }
++    }
++    Ok(())
++}
++
+ /// Recursively build the certificate chain
+ // Chain state threads through each recursion level; grouping it would hide
+ // which state each level reads versus mutates.
+@@ -558,6 +590,7 @@ fn verify_chain_link(
+ ) -> Result<bool, AuthError> {
+     let cert = parse_cert_view(cert_der)?;
+     let issuer = parse_cert_view(issuer_der)?;
++    validate_certificate_policy(cert_der)?;
+ 
+     // Check issuer/subject match
+     if cert.issuer != issuer.subject {
+@@ -597,6 +630,52 @@ fn verify_chain_link(
+     ))
+ }
+ 
++/// Fail closed on certificate constraints this verifier does not implement.
++/// In particular, silently ignoring critical nameConstraints would allow an
++/// intermediate to delegate beyond the authority granted by its issuer.
++fn validate_certificate_policy(cert_der: &[u8]) -> Result<(), AuthError> {
++    use crabefi_pkcs7::der::Tlv;
++    const EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
++    const CODE_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
++    const ANY_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
++    let cert = parse_cert_view(cert_der)?;
++    for (index, extension) in cert.extensions.iter().enumerate() {
++        if cert
++            .extensions
++            .iter()
++            .take(index)
++            .any(|previous| previous.oid == extension.oid)
++        {
++            return Err(AuthError::CertificateParseError);
++        }
++        if extension.critical
++            && extension.oid != oid::BASIC_CONSTRAINTS
++            && extension.oid != oid::KEY_USAGE
++            && extension.oid != EXTENDED_KEY_USAGE
++        {
++            return Err(AuthError::CertificateParseError);
++        }
++        if extension.oid == EXTENDED_KEY_USAGE {
++            let mut allowed = false;
++            for purpose in Tlv::parse(extension.value)?.contents(tag::SEQUENCE)? {
++                let purpose = purpose?.oid()?;
++                allowed |= purpose == CODE_SIGNING || purpose == ANY_KEY_USAGE;
++            }
++            if !allowed {
++                return Err(AuthError::InvalidKeyUsage);
++            }
++        }
++    }
++    if let Some(constraints) = cert.basic_constraints()?
++        && !constraints.ca
++        && constraints.path_len.is_some()
++    {
++        return Err(AuthError::CertificateNotCA);
++    }
++    cert.key_usage()?;
++    Ok(())
++}
++
+ /// Verify a certificate issued directly by a trust anchor.
+ ///
+ /// Per the UEFI specification, certificates in the db are explicit trust
+@@ -653,6 +732,7 @@ pub fn verify_certificate_chain(
+     if chain.is_empty() {
+         return Err(AuthError::ChainBuildingFailed);
+     }
++    validate_path_lengths(&chain.certificates)?;
+ 
+     // Verify each link in the chain
+     for (i, pair) in chain.certificates.windows(2).enumerate() {
+@@ -660,29 +740,16 @@ pub fn verify_certificate_chain(
+         let issuer_der = &pair[1];
+ 
+         // Verify the chain link
+-        if !verify_chain_link(cert_der, issuer_der, config)? {
++        let valid = if i + 2 == chain.len() {
++            verify_single_cert(cert_der, issuer_der, config)?
++        } else {
++            verify_chain_link(cert_der, issuer_der, config)?
++        };
++        if !valid {
+             log::warn!("Chain link verification failed at index {}", i);
+             return Err(AuthError::SignatureVerificationFailed);
+         }
+ 
+-        // Check path length constraints
+-        if let Ok(Some(bc)) = extract_basic_constraints(issuer_der)
+-            && let Some(path_len) = bc.path_len
+-        {
+-            // Path length constraint limits how many certificates can follow
+-            // the CA in the path (not including the CA itself)
+-            let remaining = chain.certificates.len() - i - 2;
+-            if remaining > path_len as usize {
+-                log::warn!(
+-                    "Path length constraint violated: {} > {} at index {}",
+-                    remaining,
+-                    path_len,
+-                    i + 1
+-                );
+-                return Err(AuthError::ChainTooDeep);
+-            }
+-        }
+-
+         // Check revocation if enabled
+         if config.check_revocation {
+             match check_certificate_revocation(
+@@ -925,6 +992,95 @@ mod fixture_tests {
+     /// serial: must never be accepted when CA is the trust anchor.
+     const FORGED_CA: &[u8] = include_bytes!("../../../../crabefi-pkcs7/testdata/forged_ca.der");
+ 
++    const SECURITY_ROOT: &[u8] = include_bytes!("testdata/security-root.der");
++    const SECURITY_INTERMEDIATE: &[u8] = include_bytes!("testdata/security-intermediate.der");
++    const SECURITY_SUBCA: &[u8] = include_bytes!("testdata/security-subca.der");
++    const SECURITY_LEAF: &[u8] = include_bytes!("testdata/security-leaf.der");
++    const SECURITY_BAD_KU: &[u8] = include_bytes!("testdata/security-badku.der");
++
++    #[test]
++    fn security_rejects_unknown_critical_certificate_constraints() {
++        let config = ChainBuildingConfig {
++            check_validity_period: false,
++            ..ChainBuildingConfig::default()
++        };
++        assert!(
++            build_and_verify_chain(
++                include_bytes!("testdata/security-critical.der"),
++                SECURITY_ROOT,
++                &[],
++                &config,
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn security_enforces_code_signing_extended_key_usage() {
++        assert_ne!(
++            verify_pkcs7_signature(
++                include_bytes!("testdata/security-eku.p7"),
++                b"CrabEFI security regression data\n",
++                include_bytes!("testdata/security-eku.der"),
++                true,
++            ),
++            Ok(true)
++        );
++        assert_eq!(
++            verify_pkcs7_signature(
++                include_bytes!("testdata/security-leaf.p7"),
++                b"CrabEFI security regression data\n",
++                SECURITY_LEAF,
++                true,
++            ),
++            Ok(true)
++        );
++    }
++
++    #[test]
++    fn security_rejects_signer_without_digital_signature_usage() {
++        assert_ne!(
++            verify_pkcs7_signature(
++                include_bytes!("testdata/security-badku.p7"),
++                b"CrabEFI security regression data\n",
++                SECURITY_BAD_KU,
++                true,
++            ),
++            Ok(true),
++        );
++    }
++
++    #[test]
++    fn security_enforces_intermediate_path_length() {
++        let config = ChainBuildingConfig {
++            check_validity_period: false,
++            check_revocation: false,
++            ..ChainBuildingConfig::default()
++        };
++        // All signatures are genuine, but pathlen:0 forbids the subordinate CA.
++        assert!(
++            build_and_verify_chain(
++                SECURITY_LEAF,
++                SECURITY_ROOT,
++                &[SECURITY_SUBCA, SECURITY_INTERMEDIATE],
++                &config,
++            )
++            .is_err()
++        );
++        // The same chain with the intermediate explicitly trusted is permitted:
++        // constraints on an enrolled anchor do not restrict that explicit trust.
++        assert!(build_and_verify_chain(SECURITY_LEAF, SECURITY_SUBCA, &[], &config,).is_ok());
++        let invalid_chain = CertificateChain {
++            certificates: vec![
++                SECURITY_LEAF.to_vec(),
++                SECURITY_SUBCA.to_vec(),
++                SECURITY_INTERMEDIATE.to_vec(),
++                SECURITY_ROOT.to_vec(),
++            ],
++        };
++        assert!(verify_certificate_chain(&invalid_chain, &config).is_err());
++    }
++
+     #[test]
+     fn pkcs7_variants_verify() {
+         for cms in [CMS_ATTRS, CMS_NOATTR, CMS_KEYID] {
+diff --git a/crabefi-core/src/efi/auth/testdata/security-badku.der b/crabefi-core/src/efi/auth/testdata/security-badku.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..da9bbf0c9ea5170170659c6cd271f2d14b482b7c
+GIT binary patch
+literal 755
+zcmXqLVtQ}T#CUxHGZP~d6C<MmFB_*;n@8JsUPeZ4Rt5t}LvaI9Hs(+kW*)xc)a25l
+z%#upoq{Ni$QUf`0UL!L@149c#Q&UqT%P4VPV-VLA%EhO(iBSpJB1TpQ<|amd2B1T@
+zn3@<F8Lso~`5es2`Poltc2w@Oy7qr7E>}FAt+qn#z`U0C&u>3ZDs3{^eKXoQ^5HMd
+zaubVRRhma<KAFR1oo}tD^UGqxzD?(?WV=4>vI=9~T$56k<hS;LxT$ewkx$(Q{v|0V
+z<8v;rkGZqv%B!PsFH2Pqy~;Q+@mr~`_cXg#lX@bf)_$6PedZ@8`}X%5N^cLnP8R$Z
+zu<Dx9yYNGc_=}x%x>o%7FiUNU!`_{Hm<}g*{n>v}JUHjEiQtcI2`XK?SGWm=rO!Jt
+zLr8TBPelaFz3N26<rnmxmvitmA9t{9dVfvw#o7SX&u5q3JGrErp-jHzV4Vm{ZP0OR
+zgHO(HnTxHjU*OT%y}(YCiJ6gsaj}zug8@G<>}7=+8UM4e8ZZMX13r)dKS+RunTd(T
+zKo-R3V-aH!$q)2-ug@a+gg4Jo|IOoDtCh_+$|8p{Fgk&u%*Y^rh3jR}?}dCES^hDr
+zDt^0N(wMM~(W-XG<hg!%m5U7QG=hBi9&8B{%KY?xV@j>}Ki^AX_gk0pC#<}4YUzXo
+z%VlS+&x%Sgtp4b8BVVm&qIrg$>oJYV#WN-Cic_l2Z`o6Lb93TExo_VaD*8-<g17gW
+zmR3HHWdHI}q@sBzw|$C7)VE63TYp<J^mZ~I@?6Ha_|4s}x%WQ5iIAvqkrIsgZ8_89
+zZ=C)76*_uS4NQL5rG&of@@Ah4`s)8RdX}Z4^L^E~j}M%9v7^+W@J*}8H{FH4d#>@b
+z<V;&Ke*()q9knx+?-H&~nr<B<r4jR%Z=t~TNvk}px1Hqsm)FXC<*ZRd@7}Bp02KW)
+AO8@`>
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-badku.p7 b/crabefi-core/src/efi/auth/testdata/security-badku.p7
+new file mode 100644
+index 0000000000000000000000000000000000000000..d227663f70fe18aaf92d9b4d2e683740c2e00fc0
+GIT binary patch
+literal 1375
+zcmXqLVvT0w)N1o+`_9YA&a|M3)yJTT)q{zV(U8}Gn~gJ}&4V$OnT3fF#DOVeT+qby
+z*`SH(y+IS>^##mKj7&iF2E1?ujNGgY29k#22BK`tp)AZie8s8BrA3(~mAXlZDcPk4
+za^k#3W`+ia7KWy#rbd=g;=INnt|^p@PiqsS60${%tPIRejQk8hhj1}9F)}h-=iBo+
+zn3MCfpVI88+-G&||5jYCcsg5ch1!96E$^S-ex6j?WU~8av~%RcUz+767Qd=AkIsBD
+zhs!$OT2JSf#fE*G&RfZLeb{9c#=N;Er7X#B?E`UB<IEzTx()nGQclL_TwWh@XU&yY
+zN8?_WsvdfkabV)NQeE$9cCRM&L`JRsH2wO_Pfqsj?=_U(9(tWD_%C49HKljqhZgY{
+zJLz<-`0-(u+7ySqJNGahPVV}%|Dt$s&SMk7AKMaCx^}N{6AVkAcVdQ+>J*-e2$p-*
+ziH6HB=shpz;AuYYVA=Hkn&gYM0ji(RF1>ehNjF28e9OT)5tiDZ<JJbBoZm7RTVKDx
+zqqBQ~ohTDCBLm}NCj$oqeqh+k3NtePXJIv922uumAOU`m01Gn{6N`Z?h|k9&#v+m*
+z=<{BmMe+%6o}>Po$G281n{Sjw4rO3;0z;XRLH-KY%c9>4`8cxtV^&rCcDtl8VH=}W
+z?T*QF{qiao8Q5tA`S3m15+;=S>HWr(TJL|pm%{G1F6B>HdFRy92?>_V&RU-pm0(!?
+z(dS0KTF*rD3_I6j8k37>O4=2tRGr_lr|{<H#EEj>zBg3#nFIxI?=dZ{d?3mG<)cVN
+z^G<I26pyHHm8`e^wq)q-WIp7%jB)XsyIphdeSQ-mQR5;d81vh5rpMnn`}r$$^rRY?
+z{H{w0ebwd7J{R=W|7-LtOGW4Vs&5}3IPqdfsX^hJR*`SI3w`%o<7dg4wq*VUmU%jA
+zXDZ(%T%9!CIz~z(<}Kesf$Ni2d01~d$@ed>mHEn9qlVtSSsM(SnDl_jUJI1k<?y6Z
+zkUVnUS<v{zKmwjSIGGKR^OAuKLWb3lA1!Mb=p$rV43$_En$&iwUM?`|vc1C;H}~$l
+z9g1ej?~LE8G~RE%V`&h)<B35fLIb~HjzJcZOBl6~Ibz5hCIc=u4oLoHW(Ot}7@LWS
+ziJ<|Q77%<!2LpCCR&73JCU#VD4df&P%$O`qj0~M8C*7_owad*tbg5Fm+;1&c%27R!
+zR122L{YRFqS6Wk?(rxE>*DT_ivD8<wMwWJGnY2%Gyg7!SjShPJ4d}J_d}q>gg;`Q(
+z!nJzVSbl5%GADhaxWP)c1rzo1?krL~XT72%VktxTg4TeezlHp*kBLc_HQD6{-u)cZ
+zzx9fSzga8$oR@~bdfV$2>ed&^_Z;~4(>42`=<h$VH!?O&eSITgo4Lc(ysouVPBk95
+zQSD^d(fmH!J!R^<RbLmB-goPeS8n-vaix@2O<C^b|5XR3Oi7vl`0CfZg_9n9-nc$9
+sUw&2Ony$k^2PWp-EGjCQ>$&5nP`KHw2X5uB?X)y{qlKQPa;#bf04nGRL;wH)
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-critical.der b/crabefi-core/src/efi/auth/testdata/security-critical.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cf29bea0e535a68687275d4e6e44854e80b44a9
+GIT binary patch
+literal 801
+zcmXqLVwN>%Vq#su%*4pV#K>X5%f_kI=F#?@mywa1mBB#5P|QGtjX9KsnTNMHHMz7X
+zv!qhDC_lf%Ku(<3$js2d(8AEv)YQl_N}Sgi#5IL-4P*?Z3?v{r1>riAf%-F(6LSoj
+z7?qH%Vq|4tZerwT0E%-lH8C<WtW$mC?znHRBkQl1Pd0vaTzs)|{p@G|U8c-FXqT6@
+z{;b0JPmdd9j~14PKAI9J=MZ%-b?xjZk7>IEPJU>(xmWX3d%@>^nZU-t)!Y2$x6OX?
+z;a%d4%VF-v<k{>VPJQ)R{)dI|**$Hkrb`<iNh;VHNGY<#$O~O~KJm-NmQPXc-go!g
+zPcPZ%wJFo>G2e<qZfysa#!tV!OhHZgUUbg7Ah{E7er{_CvCD6CpV7L>>-L+rhfS|v
+zOqX+Dn_gb8TB*i=H+1ugEozG=ubA=E@Ww^f)KwMbzRPFxXFPX|o>TTVq9@Dd;}kPx
+zwmoOBi>?<JFxhhUqUPe)KBw>MKIH!x_9M?>lU{Tx6Eh<N<KjGn90ML;7|IGWGX7^_
+zGGH*^1M&DlJQijq_6Crw7BdT278qNyAXz>ZF&2@3uRThHW&0hXHrp%q8Q%$-m9yU7
+zKprHm%pzeR)*$jI?B0%ywsT!4KXshv_xa#*<Fn;q<QM@)J}^cY8QSgk&a4zw6Fix2
+z^7+_WMw3gE#d7Q=T~z&CnOCha^|d^sVZ7yg@Xjn_`E}*Xc+#ie6+EYA?0tU1$BM^=
+z;%m;_Vy=9+cl}0jBk{!&7E34GWPkf7C^#@b#%43S-}K*s&0-=~SL$h5T&RsZ%9N73
+zA}UC$oPE!&{TmBvTX-V#PVq`L1U{OOr1Uj>tzm+kZBMz~L!ocnB^HbwuV2n+O%AC`
+zoNgnzZ_&f)TN56f^^Da1I;~eWVjJH+rszKtH!?k4bG>MpxZyEosn~{Xii?lk*s+VJ
+zH2Q+)b$+JRo8SATXdd_2A#me&&b;is8=0JQ5;B(BzLNhPwCv0_iMr1hvVO0cI{60x
+D!3;sS
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-eku.der b/crabefi-core/src/efi/auth/testdata/security-eku.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..61d4f1c79606526b3a05b76ce526671821c3d57e
+GIT binary patch
+literal 806
+zcmXqLVpcL}V&YoB%*4pV#K>&G%f_kI=F#?@mywa1mBB#5P|QGtjX9KsnTNMHHMz7X
+zv!qhDC_lf%Ku(<3$js2d(8AEv)YQl_N}Sgi#5IL-4a5ya4TK>&dEh!zvr7${7?qH1
+zVPs`sZerwT0E%-lH8C<W9N)e0|Aq(0*ZUQGh=_mjzr|$Hl%vKqOYAI+s=t5qcFA+@
+z$#GmI6>#W&^KAWszE8z@3*8z+@@;QENIoFe5PH2aD$e_u-x8aWH|P7R3eSBgS-Ca*
+zXw-2}{sXp;0v+q8%b6WZV1GXGUc=mSFUKCqnni1Z%o|o#y=0qj5P11Z^=AI9%l;g_
+ztx{=Hw|%ZtuKC=9z0Lm33hNi{iE{9Ch`d{w=<qr&JE^YWFaLINc8-h3Ej-?ay{`GN
+zb=p%-<^_AS#eX-8d#uySN!Ct1>)^rkz3zQ^Ta0Ak&JPAPoz1!To9?;rH=3~IOgOdm
+z-rbD}f0B~-&22v;b2{BQ(8l!m+DqK+^O=|#85kE=7?c_C0E16fn33^63zGqZ0UwCR
+z58|;fGqE=qh=KU3AU=-)7aNB*8zU<#J2Rt!EJ&P>MT|vc)ANhQ-?NYX-Tgy3c!oV6
+zgWrOyI}GGO(#k9n24W2&kHYTl$Y?v)b@Efkd48V{E;l|~9!8EEU<v@n4I{%emj~_n
+zY-^{Kg)Y6KeUkC*1pa#`t>b<<dE{ysMseyN6bx2+z2i*u`o7y;4BJE(ec1ZwyU@AX
+zl#}W$KX(6@dz`uW*rG%0D;64_kbe<(@O9|r#qpP(*BP9ux6JzSC2h@;j=O(MWagPX
+zyOVTi#s0*Nfs>ZHn_i4rysy3{baVUMJFoK%)68rCr}XWrnRS2SwzbwbnbNlMu2EtV
+zn}1ciMc;k#+|6^2@jTfWe`Mn!<AB8>VhcF@LRMWgzxKGM^6D<z&o6^sY}ImQa99<z
+z`L5=5k$Cktifh&7S8Vwv@a%~7?75$2F8aO2MmubhiT(rTXVISX??+q}On&gW;<WAW
+M#qR`WJ`J(~0EdlDzyJUM
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-eku.p7 b/crabefi-core/src/efi/auth/testdata/security-eku.p7
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1b17f3ece18cf85bf1f524f79a1ed23b08b1ca7
+GIT binary patch
+literal 1425
+zcmXqLV(n$))N1o+`_9YA&a|M3wa%c4wTg+6(U8}Gn~gJ}&4V$OnT3fF#DOVeT+qa<
+zX3)f}WYEOKwSbw4k%@_s*?<?WfRUS(!9c=L%s_;VIh2K&hqpL2xwI&=q*AviKflC4
+zPMp`s%+SEl!qC*z)W|YQoYxq{HHC5w#0^CagdsY4;5t*YOAVSBm5^;=WMyD(V&rE4
+zigPhFF)}h7-@Wkvh6l&j`xShMh=1|F#bnWxqsBE$>@19`zkl?0$#d?>aa<)8aOi&X
+zZ2f}1PsMo)-5NvkZErqEJ|NZ*dc83!&ik0(5}T4Y=liM(&wVIaxi$P~)NxP#1GbL>
+z9qXsdnH@`De?IYE!`yN&#~#U=MQei08&+1mWSeggc==29X8x_q{v5rnQfX4ReXdik
+z`P_rO&Hl{_>lf~ca`1GByjz**@H#F#sjlHK|8{Y9j*G`FJl=-AuKBQa+EY&E1$(r`
+ze>aPJtkcR#)=oX^;KB60?tOV%jAY@?4+b@z&AIoR?z!+cny}<dIJNcO-Hi!<l9Kn$
+zZ9gM(I^8+Y#`O5wOWf`AnV1<F7#CL<lo{{<gHKkNk?}tZlL3PPABe{f;;}F@u{Riq
+zf%vK*K92zx8;3R<BP%OAGoyhlNSu#Fj74PA^NYscvyc7V{X;o;hCLsH--4?<4CF!5
+z$}AEFVhtjX!tU+JXgk++@>9ooexDC6H$Gb)Mvfa`3IN6pBf~V82krT6Yp0ZjF1@0C
+zlJV^X{(C2_<9<1L<Z2j3aq1rw3|4x*<4pAWzS~_4+e8<A*!t+Z(7D=_lj<!$cK?@q
+zoVobeqC@K|78;(Ae-U@^b?D{A@t2<08Jw!O%=+;qZOxL7yMIh%=9xUZlXPgs{=|)e
+zla{)hUW{41uf8U9bNk#ouk#Jl%xnLr^zEvdb${ZvwbnP8(zf!hQDPFCe^t9h-+l4i
+z&2x_NJlPn3WaA;@fW;wV3po5jR$Vl|_PD0<>Mq;QFN0oe)pBKUSQWJSuI6=-c=b1m
+zYt`jfZ22be?1=U3xu0e(`n|<QJ8Y7P{sZP`(Vp|~M_d(5e(<^CwC(T3?*wK(4YDz8
+zV$ucX5=~%+GLXfcCqVfJIkzond}1I0&rh7phRC_kKn5YhYRHe4n+)_3vMh#5EDB9(
+zyHqb17<Jj+VTzl3_uURfv*dTi?^PP_H{Y=|2;T9;pc0{h-!R7@3&|ynTF4wRWDXN3
+z=|D;ZW_Dl_gRz;Im>3#>NdduUbTD9NW7XyZrae?~4dfI9%*`xKj0}@Zg8l@)J+)S0
+zF-zXFV>_ddoa0-@v*lRhx(|!r1;j0VxOc`pw@q_zUf$rtw1@5Krjl)%J~c0Ihkv{M
+zdP=jN$Mzc!Dvj4Jd9=swaoe(nWv3pPWpN()qBbvVf&Q!96KmFSdLP|4^Wj!6>A!bA
+z>4?k_;*z~TA(FLry?{l-2Sp?HNer(SY`XfeZKk*2I(4g4nvzp=Wt^NM!nUU<UXG1X
+z&3y3i{X^m91sv}mS;X(Pn|^<*tj*H5`+4qfbz1Abh3|rd(+iu2GR6zcE}UjQ`1No_
+zTUG3ZG`&lP#b>UjPgmWkQE+^@n4r4tb}d1*__&zW_k`9p1Z9=RIY#^BFS4~NRn>6O
+G&ISMzT_G9(
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-intermediate.der b/crabefi-core/src/efi/auth/testdata/security-intermediate.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..b36392495d4446bd9e5346eb2cf454ca8666bff3
+GIT binary patch
+literal 797
+zcmXqLVwN;$Vq#pt%*4pV#K>d7%f_kI=F#?@mywa1mBB#5P|QGtjX9KsnTNMHHMz7X
+zv!qhDC_lf%Ku(<3$js2d(8AEv)YQl_N}Sgi#5IL-4HOLJ3}hfWMd3O#^GZ^Sa#K?>
+z6H8JJni!Rktz%?mU~XdMX8?+GF*PwVGAyvYJF&LZ*!cgG0`AEFX7OrIRZ=-^mS*KS
+z{nI?T<VCo!&F&-DmSvUfHVO@paar-?rqq<lkxXydjVsi-Yy+3pUA)&gr>umza+#af
+zCuPpftv`a#h;yBJ<D06n(O>A|k;T~#TZF$CxFls}C@sGs&aF0Y<<$!p4(c6^3Xpq~
+zb2;y~$AiD8&)o?=b>rBj`tE6m*iE+X+<tP=wdb5chYh1|bH!<~-sSWDXtAuo%{Rm4
+zoFw0G#V`AxXYfp0ZPu;5QIWS+PgF@?`{lO}b>CWCJ#7ATMtnQZe)dMxb??XjE=-@p
+z(^pl@oVQr;={FO(m+NGmum99LA@krG*J*{1U2E^xPJ8Rm#LURRxH!!q#Xtxcj<Ujx
+zjQ?3U4A_7a6C;BGA4rTJB*wzb#KdAC3*z&!h_Q&=+2%S)p<UGX(cYR)wl@#<HB8|$
+zGmr;KE3-%#h&6~j3cI%>qwQSR$xj{U`F%dP-1uyH7&#_@5f6+BMuy$R6SZYaR?PTm
+zm8@RN@k7RMV|Lifu%LZk?H4~}?qX7ux2WcfV7n?lDZci-{hyOTSCh84yiPOG*k7%(
+z?$~WH-PtF_noRXwJ8u}VIZfAj+PXYBLaSR$%tT%P#GR`jE2>3}be1$U%PK~l(LS!q
+zIxUdxnQ7$Gu8{pV)f{iE{q*&aTVP4%)?0P|WX{F~ZBbR2P;&60MZkfiKBaZ+cC+8t
+z9(`A9Im1PKrntDvuB~TOSRGhjH74{_-@MMaIFH$oapFQX2a&Tj?N{fi8fC?wjkSDI
+z*wpp@t7XR8x7+%Q5A^YP&CPo0@o-;PV`WwHVfHP$*9$kV+qL%ly4x>ZUWjmhnkfPR
+DLP9<T
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-leaf.der b/crabefi-core/src/efi/auth/testdata/security-leaf.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..15fc8c291efe500e22522b21a27b5461133deb57
+GIT binary patch
+literal 784
+zcmXqLV&*YuV*IjznTe5!iIK&CmyJ`a&7<u*FC!y2D}#Zgp}2u48*?ZNGY?;JYI12&
+zW=W-PacNR=qJf+^uaTLdfuV(=si~=vWt2FtF^Fpl<r+vBiW!JNwDQ8W=A<U30qs*l
+zwuh0Gfw_s1p8+V&#ni;e$gtz=pWXyZoex^OUp>8k@$Tg<vOdf=*KR$|F7xI|WgM$h
+z>$SD#xOc5_%=I+!Yw(+xQFA86#^a>5L*{yK2S%o4`|ku6q-njl_;aqz?eN(Pq&K^s
+zn>O>hdqC=xhx`2-{T!F^JpAjQcdu%*zK>h6^wY>6Yic&%;m)Y;F1_Y5O(Wrg#&fs&
+zS>}H`)k8ha`ZCSb)#sQ8n;$cDI=JIdCI8vm%1*IoisyUn*d@kQ)o8|Vckoxu>#D*Z
+ziJwK5oO$t8V!z?6)zkNH=}MSw-n%bNbAj%`XGu53AFVK&-kmY+`;_jjIiD?VDwaxR
+zdLGZWSW$ju&6V;E4BKYz&C}@btq*)<#IbWD6Eh<N<KhH^I0GJF_{j=0GX7^_GGH*^
+z1M&DlJQijq_67r45TB1lj78+7^QqU5N<1#zuK%?0?B+#I><fPUH;@NOE3-%#h&70`
+zMf^0`_qKiJj1{6b#SPB|6>PF5BgX+Su7PpD$WU-`9t+d*g}U2h+6tJQzsYj&mi279
+zI9DK%Js~l0<)=rf%+F-^t;^xh^S!%Q^3&r-(hnpK-xTp;mVKVR=xglTn}=5geE)dw
+zK}K@vdX|!NseaNN`FCqr_J+I)-)qyh_pX$o&Sn3wT%BMi&!h4h9ZIME3;b1l+pzV~
+zjI~EU3Ep<>-WfD=m;K^rN7A_D^k4ktT@udPbHwKUk1NU-G-uB;*}44nTA7x+Svf{3
+z4>Nv6Io3-G??3QEVxiOXMHz0qv%hgXIeF*Hu5u3d^_pALyiMn?EHRQy;W*sB_HiFG
+r|BZ}!cM>a$ME6cBXZ@BCk{Wv7L898l_KuL;@*YEXb=yuqH?=1K)Neoj
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-leaf.p7 b/crabefi-core/src/efi/auth/testdata/security-leaf.p7
+new file mode 100644
+index 0000000000000000000000000000000000000000..482e35448cdc9a54b7fc460d4981e2e81dece6fd
+GIT binary patch
+literal 1404
+zcmXqLVy$4~)N1o+`_9YA&a|M3HPfJpHI<2x(U8}Gn~gJ}&4V$OnT3fF#DOVeT+qZU
+zV9><OW6;F-WdSo2BNG!NivcfO0V6jngMp->xPd4eb0`Zl4_|R=a%oX!Nu_RaX;N~c
+zft)z6k(r@^p@pHTsi~1=lsK<3h-(Vv8b}z58Hhl%^1`*|q$Z{T?NdUwhmn<mxrvdV
+z0VvMJ)Wpchu;c8X-ULgX4_dolJ-vSM?&U4AKFl}QZavN}^X5rq9II37wYBHCcdc>E
+z^)&Ho@SB)Xb0)>c<D|7i=6Y`jMy6%^?*ta4X}!4kbFR$o@YxHbH@lvjHuJiBK<bo-
+z`~4gJ9GCGt{Og~0uWGZtk6W?y)5srdYBt~D&ZzD#z2-7aBjJL^bGQ0g=6^fYLp{y<
+zGR@T0=a>hZA2W11xZ_YI|JmEhPO)c-=X>qgCB{|NXvS}M@K??2s=^<MpGB6OdGS?Z
+zzu~Oa)Aw)bN|<flyDv?1f$qU)NjJqGtuUJ2oiXkEl<uuLpDk`GmP%!M9?!Q}QGR93
+zmGTV?+h*>~)9CN54}4|Bv2!C6Gb01z;sk>@10G=b$qF+v{%2t_U@+hV@%TYJ7G@^)
+z1_N0TpN~b1MdYRPsn?H6JTBd?|FrS!=0#5I3x51JkOxUCvq%_-HHfrD{50A3wteP|
+z6{0r94bKG?Y_cXJ#{n>|fpNgdP;hY`3)Aw2y4z&h3YeU~$#U?P^=!I0S0Ir+Au({}
+zr$?#G&t&(l%i+)Sy}MWP)8j|d4<ruX6!Bt~eV)DOYwX*bhgSuB|9I~~Msn$TmXdR+
+ze$pKIcWYSohP(>jYty#(u9Tt9W&f~TonR-=qw*RZN~it{{8fD0u=UZ5wMRb*-gfNX
+z88ma3{o-dw(zxXGU;O1=63*Il#OD5wE6Nu%XU{U(x%~B7nU=d*IYufEGk!%m)=LWS
+zKk!3hq0{q48E(9@zi~V{dFRWnat`<Pnp@MnP3NyHF_KK-INZMWaUV1Pjf{DB5-W>D
+z_f9Kk{gx1t8hYPBqT0pwj*#5)9z%C^+fF|>wI_y6OnL@QOj^LKV<3ko^@Fksa>iQF
+z_{2a0o^?2x4UsdNfeb>1)sP=8-x%m4WLXTASQMJncBx)2FzT|s!xT67?z<g|X36i2
+z->Wp<Z@yz`5WM4wK_x;1zhRC+7LrRCwU9Yt$Q&jEE;bHG=4WOHrX?7giHV7!0hksL
+zd`1TYb~aXRK42n471uycGQe!h(!|IR%5ow-?7?nt-4FHwPfkj6FfNc3vfsD->Up);
+zgL=L`&F2yl?}xwi-F0kj>tyclL326Izs_Km+Zyp9@L@sSDRu^{%9lAOKC$V>uW@ga
+zeciq_Aw6YZK_Js=vCp+B0sF6aTsWVd@<yofN5gW4*9!NHqxSNu{+;nsXRT|1%->2D
+z&Ly4s=RD>Y`Cgf~?edXoN4|e73VJ0QPh7UNUzV6u%WvkoozZ>5{Kac7aQ}Po-TBx0
+zzqe=jWrVSs9b8$NKl_Q(E7$24Rb331t^Ft0)7_-%aGvAq839(ID06!gnd?n^W=%Yl
+m61-<wt=WOE_b>n4WNcOSQgy=%U8z-5S%X`iZF2o~qZ9yZ>k_#D
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-root.der b/crabefi-core/src/efi/auth/testdata/security-root.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..1168808fe3cc6df9847653d7336e9b4dac9a7d4e
+GIT binary patch
+literal 756
+zcmXqLV)|gv#CT%?GZP~d6C<MmFB_*;n@8JsUPeZ4Rt5tJLoovpHs(+kW**++)a25l
+z%#upoqWt_4137VCBQrw-LkmMwQ&S_$C~;n65Z4sS#iO%{Q3=@^Mpg#qCPsb+pfk9b
+zniv@wj;!6s`*YR)h`LYN=O-vFcRu6&+UCD!-|yUB@reua&IPE3WuzPI+g`fx)2B06
+zPiKCsPWf=+M9AV}CdQ3b?(7e1*8Ews+om<IAx3R)f_|XC&PDbA3z!pZHt77+kcx~r
+z+Hu`|`|5z;-+Npvmz<U|_0r$bWdDgRTKBv8d#e=-Ogh&jFy7UZHI~>{G3Uqr8GEBu
+zB;sBhJ>T}MBECKGgJW^i7sFx(rtD5N)^ZVDrzv{g%(qv{eX8GNI>W5Oe?tUIWIp2z
+zkIopwdDpglX$wp}Ajf0OK4IUKInO2YmwcPBHX=%Rp7xEt9bcYKwcj<hbpM0xsoQnF
+z@BBA=PeOUUbH)9x{(2^6Mh3>kt_IEqLcoxh6=r1o&%$BA2Ber6nGN_rV*DU67G@?U
+z76VxjpN~b1MdVS~y&V~C=ekaQ>NwBu^TFlDXUoIL0S$~#U_di6O!Qlxo~|Q&@gvXP
+zZ@iqDVQebgfh%@TH99woE6~#7(eZf>%dN$fg9Pn!UE8et&RCptvb|iPa&p?INzZ-1
+z8@v(x9+Jm@dX1Bgg6wsd1!*rVeXJ|iFRAO?Dt&P8?2tp>GHO+|Jp!|29!al$a7Z#x
+z?nL;V7XfzXjrRTcnsSYO@^!Jk^o@6<Cr{dJ@p0-=x5+ifcWwOYYq5FqJki-**Z1#y
+zuIKmrWU_v^h4ZH-4~e#OOw$?y7%yySW!%cQ=Ba}`%NZTJvv(z?URp8#Z02s^n4LQA
+z8<(m_>}X)xq{BPI+5U>-r~4h;Pv-0HI-I_{;=WEl%gThNF9q*I7_MFX61Ss8IqLxc
+D+37Rl
+
+literal 0
+HcmV?d00001
+
+diff --git a/crabefi-core/src/efi/auth/testdata/security-subca.der b/crabefi-core/src/efi/auth/testdata/security-subca.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..aadfab2220c4fd394b8897e5f7c2fe915134f6e4
+GIT binary patch
+literal 795
+zcmXqLViq@OV*I~=nTe5!iILTSmyJ`a&7<u*FC!y2D}#Z8p`3vX8*?ZNGmmI-YI12&
+zW=W-PW?o5ZQEqBVW@1UIft)z6k(r@^p@pHTsi~1=lsK<3h-(Vv8b}(78;C+o;Deh`
+zT$+@e2((uT**->A2IeM4eg>d87gG}>Bg3@R!#^hN+wCotTUTZC`1Xwt=a{x$KP4pg
+zHc4|{K<BT$wI|-)W-h#KW}bhp;?L3YW8aN5WzxC+`%F-(T)Z|^OD{E?vE|05-QC%p
+z;@`So*MHn_sOf0D(|q<DKW|*PH<{rN-<3)7{D0kheLT2l9RA|};7Q?n;T^NCb#Cc=
+zr5im{wkCap{X?7PrKcFCbZ7|rbv|vcn_VN^J*DqT|2u~-g<+zph6{r;LsnTG*tgim
+z=B>&%=RU*3kJmA;e#O(;Z=PxR@XhCy+-D;s*US)~^Tp6lV&1mA(4&9rGg7?%9Xf6O
+zJa^{{eVHb;WfMxbX!Qu{#7q(QJ5}=6PcfZ;!Ld^{^ON3PXJTe#U|gJRkZ8aU3_w|7
+zM#ldvtOm?L%770fzz-5&VP;}tF^~oE`B=nQMA{;Ln(TYqK6AzjQJdn1=Yk40S(6Rq
+zLDI@B5(Z)oB6qgAPEu$W^?kIrrjzZ>gMAHCxXh5F0T}JTXkcXMUTX5gPJ7DjD;#2c
+zfBZ5%12<>z&08UrdwaF~<|Q7c6W4DF3sLf!q_^c4n@KA}iE(mi<%(TG$F1*1&vN#u
+zXLmQ6D`G3zxXSX)?SoTGr>F0hdZd=f*|OJYm#p`#cMk=4?We!6uzdQWq^yi7{q31w
+z59Ac)b}P?{>i8Elckj_pHw|vCP->j$G3jJyZFivB{u__=GajkL%+=C+a_fon<_&G8
+zL7(a~*Q-4*V1DiP+}SzqfU2s%%<i`uv%V<rmNxOr>Fs_!=cd)p^P9E>?2rG@#eL+z
+z{PTdvk&jJy^%$l(mwtKmv(@kSE|E?R$=mZ?o*nu2rAhSkqPF$t#pC;4CoeqyL<j(P
+Ci%59@
+
+literal 0
+HcmV?d00001
+

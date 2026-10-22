@@ -1,0 +1,219 @@
+From b89ca4e143fbe9e7788c051493e3141c04f5a02c Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Thu, 15 Oct 2026 23:04:22 +0200
+Subject: [PATCH] core: add enforce-secure-boot locked policy
+
+Image verification in LoadImage and the direct-Linux guard no longer depend
+on the mutable SecureBoot/SecureBootEnable state when the feature is set.
+Default Microsoft keys are never auto-enrolled, disabling Secure Boot and
+clearing keys are refused, the Secure Boot setup menu is compiled out, and
+boot halts unless the persisted PK puts the platform in User Mode with
+Secure Boot enabled.
+---
+ crabefi-core/Cargo.toml                      |  6 ++++
+ crabefi-core/src/boot_manager.rs             |  2 +-
+ crabefi-core/src/efi/auth/boot.rs            | 11 +++++--
+ crabefi-core/src/efi/auth/mod.rs             | 19 +++++++++++++
+ crabefi-core/src/efi/boot_services/images.rs |  5 ++--
+ crabefi-core/src/lib.rs                      | 30 ++++++++++++++++++++
+ crabefi-core/src/menu.rs                     |  7 +++--
+ 7 files changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/crabefi-core/Cargo.toml b/crabefi-core/Cargo.toml
+index 6b071ec..4992e25 100644
+--- a/crabefi-core/Cargo.toml
++++ b/crabefi-core/Cargo.toml
+@@ -16,6 +16,12 @@ xhci = ["dep:xhci"]
+ tpm = ["dep:sha1"]
+ # UEFI image/key authentication, independent of a host firmware's signed FFS.
+ secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
++# Locked deployment policy: image verification is unconditional (it does not
++# depend on the mutable SecureBoot/SecureBootEnable state), default Microsoft
++# keys are never auto-enrolled, setup actions that weaken Secure Boot are
++# compiled out, and boot halts unless the persisted PK/KEK/db put the platform
++# in User Mode with Secure Boot enabled.
++enforce-secure-boot = ["secure-boot"]
+ # Signed firmware capsule application requires durable result persistence.
+ capsule-update = ["pkcs7", "variable-store"]
+ # Shared verification implementation, not a runtime policy switch.
+diff --git a/crabefi-core/src/boot_manager.rs b/crabefi-core/src/boot_manager.rs
+index 4f04237..cdde2c7 100644
+--- a/crabefi-core/src/boot_manager.rs
++++ b/crabefi-core/src/boot_manager.rs
+@@ -420,7 +420,7 @@ fn boot_linux_entry(
+     // when Secure Boot is active (filtered in scan_partition_for_entries), but
+     // check here as well in case an entry somehow makes it through.
+     // Direct boot bypasses signature verification which violates Secure Boot.
+-    if efi::auth::is_secure_boot_enabled() {
++    if efi::auth::is_secure_boot_enforced() {
+         log::warn!("Direct Linux boot disabled: Secure Boot is active");
+         log::info!("Falling back to UEFI boot path for secure verification");
+         // Fall back to UEFI boot which will verify the bootloader signature
+diff --git a/crabefi-core/src/efi/auth/boot.rs b/crabefi-core/src/efi/auth/boot.rs
+index 1d57dfb..d9ebf75 100644
+--- a/crabefi-core/src/efi/auth/boot.rs
++++ b/crabefi-core/src/efi/auth/boot.rs
+@@ -78,8 +78,11 @@ pub struct SecureBootConfig {
+ impl Default for SecureBootConfig {
+     fn default() -> Self {
+         Self {
+-            auto_enroll_defaults: true,
+-            enable_secure_boot: false, // Don't enable by default, let user decide
++            // A locked build never trusts keys it was not built with.
++            auto_enroll_defaults: !cfg!(feature = "enforce-secure-boot"),
++            // Don't enable by default, let user decide (locked builds ship
++            // SecureBootEnable=1 in their read-only variable store).
++            enable_secure_boot: false,
+         }
+     }
+ }
+@@ -552,6 +555,10 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
+ /// After clearing, the system returns to Setup Mode and Secure Boot
+ /// is disabled.
+ pub fn clear_all_keys() -> Result<(), AuthError> {
++    if cfg!(feature = "enforce-secure-boot") {
++        log::error!("Secure Boot: clearing keys is not permitted in this firmware build");
++        return Err(AuthError::AccessDenied);
++    }
+     log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
+ 
+     // Public SetVariable correctly rejects an unsigned PK deletion in User
+diff --git a/crabefi-core/src/efi/auth/mod.rs b/crabefi-core/src/efi/auth/mod.rs
+index fe3b0dd..1290ce9 100644
+--- a/crabefi-core/src/efi/auth/mod.rs
++++ b/crabefi-core/src/efi/auth/mod.rs
+@@ -156,6 +156,15 @@ pub fn is_secure_boot_enabled() -> bool {
+         == Some(1)
+ }
+ 
++/// Whether image verification is mandatory for this boot.
++///
++/// With `enforce-secure-boot` this is a compile-time constant: no variable
++/// state (SecureBoot, SecureBootEnable, SetupMode) can turn verification off.
++#[cfg(feature = "secure-boot")]
++pub fn is_secure_boot_enforced() -> bool {
++    cfg!(feature = "enforce-secure-boot") || is_secure_boot_enabled()
++}
++
+ /// Verify a PE image after refreshing disposable boot-only key caches through
+ /// the standard Runtime Services GetVariable entry point.
+ #[cfg(feature = "secure-boot")]
+@@ -193,6 +202,10 @@ pub fn enable_secure_boot() {
+ /// Disable Secure Boot.
+ #[cfg(feature = "secure-boot")]
+ pub fn disable_secure_boot() {
++    if cfg!(feature = "enforce-secure-boot") {
++        log::error!("Secure Boot: disabling is not permitted in this firmware build");
++        return;
++    }
+     persist_secure_boot_enable_preference(false);
+     if !is_secure_boot_enabled() {
+         log::info!("Secure Boot: Disabled");
+@@ -310,3 +323,9 @@ impl From<AuthError> for r_efi::efi::Status {
+ pub fn is_secure_boot_enabled() -> bool {
+     false
+ }
++
++/// Stub when Secure Boot feature is disabled
++#[cfg(not(feature = "secure-boot"))]
++pub fn is_secure_boot_enforced() -> bool {
++    false
++}
+diff --git a/crabefi-core/src/efi/boot_services/images.rs b/crabefi-core/src/efi/boot_services/images.rs
+index 26247e8..b3ae1cf 100644
+--- a/crabefi-core/src/efi/boot_services/images.rs
++++ b/crabefi-core/src/efi/boot_services/images.rs
+@@ -174,9 +174,10 @@ pub(super) extern "efiapi" fn load_image(
+         }
+     };
+ 
+-    // Secure Boot verification (if enabled)
++    // Secure Boot verification (if enabled, or unconditionally in an
++    // `enforce-secure-boot` build)
+     #[cfg(feature = "secure-boot")]
+-    if super::super::auth::is_secure_boot_enabled() {
++    if super::super::auth::is_secure_boot_enforced() {
+         log::debug!("BS.LoadImage: Secure Boot verification required");
+         match super::super::auth::verify_pe_image_secure_boot(data) {
+             Ok(true) => {
+diff --git a/crabefi-core/src/lib.rs b/crabefi-core/src/lib.rs
+index 025f042..66b30a4 100644
+--- a/crabefi-core/src/lib.rs
++++ b/crabefi-core/src/lib.rs
+@@ -177,6 +177,33 @@ const fn supports_capsule_delivery(
+     writable_persistence && retained_staging_ready && backend_available
+ }
+ 
++/// Refuse to continue unless the persisted key hierarchy put the platform in
++/// User Mode with Secure Boot enabled.
++///
++/// Image verification is already unconditional in this build, so an empty or
++/// unreadable store could only ever lead to "nothing boots". Halting here makes
++/// that failure explicit on the console instead of falling through to a boot
++/// menu, and guarantees no boot path runs against a key-less store.
++#[cfg(feature = "enforce-secure-boot")]
++fn enforce_locked_secure_boot(persistence_available: bool) {
++    let user_mode = !efi::auth::is_setup_mode();
++    let enabled = efi::auth::is_secure_boot_enabled();
++    if persistence_available && user_mode && enabled {
++        log::info!("Secure Boot: locked policy satisfied (User Mode, enforcing)");
++        return;
++    }
++    loop {
++        log::error!(
++            "Secure Boot: locked policy NOT satisfied (store={}, user_mode={}, enabled={}); \
++             refusing to boot. Reflash a ROM with a valid read-only variable store.",
++            persistence_available,
++            user_mode,
++            enabled
++        );
++        time::delay_ms(10_000);
++    }
++}
++
+ /// Common boot tail: variable persistence, Secure Boot, and boot manager.
+ ///
+ /// This is the shared sequence executed by both [`init_platform()`] and
+@@ -263,6 +290,9 @@ fn init_persistence_and_boot(
+         }
+     }
+ 
++    #[cfg(feature = "enforce-secure-boot")]
++    enforce_locked_secure_boot(persistence_available);
++
+     #[cfg(feature = "capsule-update")]
+     if persistence_writable {
+         if let Some(backend) = capsule_backend {
+diff --git a/crabefi-core/src/menu.rs b/crabefi-core/src/menu.rs
+index b62af09..4619ee9 100644
+--- a/crabefi-core/src/menu.rs
++++ b/crabefi-core/src/menu.rs
+@@ -63,7 +63,10 @@ const MENU_TITLE: &str = "CrabEFI Boot Menu";
+ 
+ /// Help text
+ #[cfg(feature = "secure-boot")]
++#[cfg(not(feature = "enforce-secure-boot"))]
+ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
++#[cfg(feature = "enforce-secure-boot")]
++const HELP_TEXT: &str = "Enter: Boot | F: Firmware | R: Reset | Secure Boot: locked";
+ /// Help text without the Secure Boot entry.
+ #[cfg(not(feature = "secure-boot"))]
+ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
+@@ -531,7 +534,7 @@ fn scan_partition_for_entries(
+ ) {
+     // Check if Secure Boot is active - if so, skip direct Linux boot entries
+     // because they bypass signature verification
+-    let secure_boot_active = crate::efi::auth::is_secure_boot_enabled();
++    let secure_boot_active = crate::efi::auth::is_secure_boot_enforced();
+     if secure_boot_active {
+         log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
+     }
+@@ -779,7 +782,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+                     // Future: file browser
+                     draw_status("File browser not yet implemented", &mut fb_console);
+                 }
+-                #[cfg(feature = "secure-boot")]
++                #[cfg(all(feature = "secure-boot", not(feature = "enforce-secure-boot")))]
+                 KeyPress::Char('s') | KeyPress::Char('S') => {
+                     // Open Secure Boot settings menu
+                     crate::secure_boot_menu::show_secure_boot_menu();

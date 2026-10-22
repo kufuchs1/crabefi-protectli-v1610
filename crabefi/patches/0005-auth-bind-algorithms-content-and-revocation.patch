@@ -1,0 +1,270 @@
+From a11dfeb2e39023ed38ab944974bf538aa73a653c Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Sun, 18 Oct 2026 17:25:57 +0000
+Subject: [PATCH] auth: bind algorithms and content; enforce image certificate
+ revocation
+
+---
+ crabefi-core/src/efi/auth/authenticode.rs |  24 ++++-
+ crabefi-core/src/efi/auth/crypto.rs       | 101 +++++++++++++++++++++-
+ crabefi-pkcs7/src/cms.rs                  |   5 +-
+ crabefi-pkcs7/src/x509.rs                 |   5 +-
+ 4 files changed, 129 insertions(+), 6 deletions(-)
+
+diff --git a/crabefi-core/src/efi/auth/authenticode.rs b/crabefi-core/src/efi/auth/authenticode.rs
+index 1f504d7..bb89c7c 100644
+--- a/crabefi-core/src/efi/auth/authenticode.rs
++++ b/crabefi-core/src/efi/auth/authenticode.rs
+@@ -366,6 +366,10 @@ pub fn extract_authenticode_signature(
+         pe_data[cert_offset + 2],
+         pe_data[cert_offset + 3],
+     ]) as usize;
++    let revision = u16::from_le_bytes([pe_data[cert_offset + 4], pe_data[cert_offset + 5]]);
++    if revision != 0x0200 || dw_length < 8 || dw_length > info.cert_table_size as usize {
++        return Err(AuthError::InvalidHeader);
++    }
+ 
+     let w_certificate_type =
+         u16::from_le_bytes([pe_data[cert_offset + 6], pe_data[cert_offset + 7]]);
+@@ -383,7 +387,7 @@ pub fn extract_authenticode_signature(
+         .checked_add(pkcs7_len)
+         .ok_or(AuthError::InvalidHeader)?;
+ 
+-    if pkcs7_end > pe_data.len() {
++    if pkcs7_end > cert_end {
+         return Err(AuthError::InvalidHeader);
+     }
+ 
+@@ -459,6 +463,10 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
+ #[cfg(feature = "secure-boot")]
+ fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<&[u8]>, AuthError> {
+     let signed = SignedData::parse(pkcs7_data).map_err(|_| AuthError::InvalidHeader)?;
++    const SPC_INDIRECT_DATA: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04];
++    if signed.encapsulated_content.content_type != SPC_INDIRECT_DATA {
++        return Err(AuthError::InvalidHeader);
++    }
+     signed
+         .encapsulated_content
+         .content
+@@ -480,7 +488,11 @@ fn spc_digest(econtent: Tlv<'_>) -> Result<&[u8], DecodeError> {
+     fields.read()?;
+     let mut digest_info = fields.read()?.contents(tag::SEQUENCE)?;
+     fields.finish()?;
+-    digest_info.read()?;
++    if !crabefi_pkcs7::x509::AlgorithmIdentifier::parse(digest_info.read()?)?
++        .is(crabefi_pkcs7::oid::SHA256)
++    {
++        return Err(DecodeError);
++    }
+     let digest = digest_info.read()?.octet_string()?;
+     digest_info.finish()?;
+     Ok(digest)
+@@ -592,6 +604,14 @@ mod tests {
+             .unwrap();
+         assert_eq!(verify_pe_image_secure_boot(&image), Ok(true));
+         let info = parse_pe_for_hash(&image).unwrap();
++        let offset = info.cert_table_rva as usize;
++        let mut bad_revision = image.clone();
++        bad_revision[offset + 4..offset + 6].copy_from_slice(&0x0100u16.to_le_bytes());
++        assert_ne!(verify_pe_image_secure_boot(&bad_revision), Ok(true));
++        let mut overrun = image.clone();
++        overrun.extend_from_slice(&[0; 8]);
++        overrun[offset..offset + 4].copy_from_slice(&(info.cert_table_size + 8).to_le_bytes());
++        assert_ne!(verify_pe_image_secure_boot(&overrun), Ok(true));
+         let at = info
+             .sections
+             .iter()
+diff --git a/crabefi-core/src/efi/auth/crypto.rs b/crabefi-core/src/efi/auth/crypto.rs
+index bca9ea2..8260cd2 100644
+--- a/crabefi-core/src/efi/auth/crypto.rs
++++ b/crabefi-core/src/efi/auth/crypto.rs
+@@ -17,7 +17,7 @@ use crabefi_pkcs7::cms::{SignedData, SignerIdentifier};
+ use crabefi_pkcs7::der::{DecodeError, tag};
+ use crabefi_pkcs7::oid;
+ use crabefi_pkcs7::rsa::RsaPublicKey;
+-use crabefi_pkcs7::x509::{BasicConstraints, Certificate, KeyUsage};
++use crabefi_pkcs7::x509::{AlgorithmIdentifier, BasicConstraints, Certificate, KeyUsage};
+ use sha2::{Digest, Sha256};
+ 
+ /// 8192-bit RSA arithmetic width.
+@@ -172,15 +172,35 @@ pub fn verify_pkcs7_signature_chain(
+         log::debug!("Failed to parse PKCS#7 SignedData: {:?}", e);
+         AuthError::InvalidHeader
+     })?;
++    // Match declarations to the algorithms actually implemented below.
++    if !AlgorithmIdentifier::parse(pkcs7.digest_algorithms.inner()?)?.is(oid::SHA256) {
++        return Err(AuthError::CryptoError);
++    }
++    if require_detached && pkcs7.encapsulated_content.content_type != oid::DATA {
++        return Err(AuthError::InvalidHeader);
++    }
+     let signers = pkcs7
+         .signers()
+         .map(|signer| {
+             let signer = signer?;
++            const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
++            let signature_algorithm = AlgorithmIdentifier::parse(signer.signature_algorithm)?;
++            if !AlgorithmIdentifier::parse(signer.digest_algorithm)?.is(oid::SHA256)
++                || !(signature_algorithm.is(RSA_ENCRYPTION)
++                    || signature_algorithm.is(oid::SHA256_WITH_RSA_ENCRYPTION))
++            {
++                return Err(DecodeError);
++            }
+             // RFC 5652 5.3: messageDigest is mandatory when signedAttrs is
+             // present; without it the signature would not bind the content.
+             let message_digest = signer
+                 .signed_attributes
+-                .map(|attributes| attributes.message_digest())
++                .map(|attributes| {
++                    if attributes.content_type()? != pkcs7.encapsulated_content.content_type {
++                        return Err(DecodeError);
++                    }
++                    attributes.message_digest()
++                })
+                 .transpose()?;
+             Ok((signer, message_digest))
+         })
+@@ -283,6 +303,18 @@ pub fn verify_pkcs7_signature_chain(
+         // Try to build a chain from the signer certificate to the trusted certificate
+         match build_and_verify_chain(signer_der, trusted_cert, &embedded_certs, &config) {
+             Ok(chain) => {
++                // For images dbx revokes every certificate in the verified
++                // path, not just the enrolled anchor. Authenticated-variable
++                // authorization has its own PK/KEK trust policy.
++                #[cfg(feature = "secure-boot")]
++                if !require_detached
++                    && chain
++                        .certificates
++                        .iter()
++                        .any(|cert| super::signature::is_certificate_forbidden(cert))
++                {
++                    continue;
++                }
+                 log::info!(
+                     "Certificate chain verified successfully (depth: {})",
+                     chain.len()
+@@ -621,6 +653,9 @@ fn verify_chain_link(
+     }
+ 
+     // Verify the signature
++    if !AlgorithmIdentifier::parse(cert.signature_algorithm)?.is(oid::SHA256_WITH_RSA_ENCRYPTION) {
++        return Err(AuthError::CryptoError);
++    }
+     let tbs_hash = sha256(cert.tbs);
+     let issuer_rsa_key = rsa_public_key(&issuer)?;
+     Ok(verify_rsa_signature(
+@@ -998,6 +1033,68 @@ mod fixture_tests {
+     const SECURITY_LEAF: &[u8] = include_bytes!("testdata/security-leaf.der");
+     const SECURITY_BAD_KU: &[u8] = include_bytes!("testdata/security-badku.der");
+ 
++    #[test]
++    fn recheck_rejects_mismatched_cms_content_type() {
++        let mut cms = CMS_ATTRS.to_vec();
++        let at = cms
++            .windows(oid::DATA.len())
++            .position(|w| w == oid::DATA)
++            .unwrap();
++        cms[at + oid::DATA.len() - 1] ^= 1;
++        assert_ne!(verify_pkcs7_signature(&cms, DATA, CA, true), Ok(true));
++    }
++
++    #[test]
++    fn recheck_rejects_undeclared_sha256_computation() {
++        let mut cms = CMS_ATTRS.to_vec();
++        let at = cms
++            .windows(oid::SHA256.len())
++            .position(|w| w == oid::SHA256)
++            .unwrap();
++        cms[at + oid::SHA256.len() - 1] = 2; // declaration says SHA-384
++        assert_ne!(verify_pkcs7_signature(&cms, DATA, CA, true), Ok(true));
++    }
++
++    #[test]
++    fn recheck_rejects_wrong_cms_signature_algorithm() {
++        let rsa = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
++        let mut cms = CMS_ATTRS.to_vec();
++        let at = cms.windows(rsa.len()).rposition(|w| w == rsa).unwrap();
++        cms[at + rsa.len() - 1] = 5; // declares SHA-1/RSA; bytes are SHA-256/RSA
++        assert_ne!(verify_pkcs7_signature(&cms, DATA, CA, true), Ok(true));
++    }
++
++    #[test]
++    fn recheck_rejects_mismatched_certificate_signature_algorithm() {
++        let mut cert = LEAF.to_vec();
++        let at = cert
++            .windows(oid::SHA256_WITH_RSA_ENCRYPTION.len())
++            .rposition(|w| w == oid::SHA256_WITH_RSA_ENCRYPTION)
++            .unwrap();
++        cert[at + oid::SHA256_WITH_RSA_ENCRYPTION.len() - 1] = 5;
++        assert!(parse_cert_view(&cert).is_err());
++    }
++
++    #[test]
++    #[ignore = "owns global dbx; run alone with --ignored --test-threads=1"]
++    fn recheck_image_revocation_checks_leaf_not_only_anchor() {
++        use crate::efi::auth::{KeyDatabaseEntry, dbx_database};
++        use crabefi_efi_types::secure_boot::EFI_CERT_X509_GUID;
++        dbx_database().clear();
++        let attached = attach_fixture_content(CMS_ATTRS);
++        assert_eq!(verify_pkcs7_signature(&attached, DATA, CA, false), Ok(true));
++        dbx_database()
++            .add_entry(KeyDatabaseEntry {
++                cert_type: EFI_CERT_X509_GUID,
++                data: LEAF.to_vec(),
++                owner: [0; 16],
++            })
++            .unwrap();
++        let result = verify_pkcs7_signature(&attached, DATA, CA, false);
++        dbx_database().clear();
++        assert_ne!(result, Ok(true));
++    }
++
+     #[test]
+     fn security_rejects_unknown_critical_certificate_constraints() {
+         let config = ChainBuildingConfig {
+diff --git a/crabefi-pkcs7/src/cms.rs b/crabefi-pkcs7/src/cms.rs
+index e0b71de..74eb8cd 100644
+--- a/crabefi-pkcs7/src/cms.rs
++++ b/crabefi-pkcs7/src/cms.rs
+@@ -112,6 +112,8 @@ pub struct SignerInfo<'a> {
+     /// `digestAlgorithm` SEQUENCE.
+     pub digest_algorithm: Tlv<'a>,
+     pub signed_attributes: Option<SignedAttributes<'a>>,
++    /// Signature algorithm declaration; the verifier must enforce its policy.
++    pub signature_algorithm: Tlv<'a>,
+     pub signature: &'a [u8],
+ }
+ 
+@@ -141,7 +143,7 @@ impl<'a> SignerInfo<'a> {
+             .read_optional(tag::context_constructed(0))?
+             .map(SignedAttributes::parse)
+             .transpose()?;
+-        fields.read_tag(tag::SEQUENCE)?;
++        let signature_algorithm = fields.read_tag(tag::SEQUENCE)?;
+         let signature = fields.read()?.octet_string()?;
+         fields.read_optional(tag::context_constructed(1))?;
+         fields.finish()?;
+@@ -149,6 +151,7 @@ impl<'a> SignerInfo<'a> {
+             identifier,
+             digest_algorithm,
+             signed_attributes,
++            signature_algorithm,
+             signature,
+         })
+     }
+diff --git a/crabefi-pkcs7/src/x509.rs b/crabefi-pkcs7/src/x509.rs
+index 7bee8e3..b1ddcaf 100644
+--- a/crabefi-pkcs7/src/x509.rs
++++ b/crabefi-pkcs7/src/x509.rs
+@@ -40,7 +40,10 @@ impl<'a> Certificate<'a> {
+         let mut tbs_fields = Reader::new(tbs.value);
+         tbs_fields.read_optional(tag::context_constructed(0))?;
+         let serial = tbs_fields.read()?.unsigned_integer()?;
+-        tbs_fields.read_tag(tag::SEQUENCE)?;
++        let tbs_signature_algorithm = tbs_fields.read_tag(tag::SEQUENCE)?;
++        if tbs_signature_algorithm.encoded != signature_algorithm.encoded {
++            return Err(DecodeError);
++        }
+         let issuer = tbs_fields.read_tag(tag::SEQUENCE)?.encoded;
+         let validity = tbs_fields.read_tag(tag::SEQUENCE)?.value;
+         let subject = tbs_fields.read_tag(tag::SEQUENCE)?.encoded;

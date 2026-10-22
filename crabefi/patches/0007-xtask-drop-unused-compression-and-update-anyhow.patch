@@ -1,0 +1,153 @@
+From 42dd9494f611b4f007c88d558a1cdfa28901ea54 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Sun, 18 Oct 2026 17:48:48 +0000
+Subject: [PATCH] xtask: remove unused compression parsers and update anyhow
+
+---
+ xtask/Cargo.lock | 62 ++----------------------------------------------
+ xtask/Cargo.toml |  4 +++-
+ 2 files changed, 5 insertions(+), 61 deletions(-)
+
+diff --git a/xtask/Cargo.lock b/xtask/Cargo.lock
+index 27699b3..21670e9 100644
+--- a/xtask/Cargo.lock
++++ b/xtask/Cargo.lock
+@@ -2,12 +2,6 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
+-[[package]]
+-name = "adler2"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+-
+ [[package]]
+ name = "aho-corasick"
+ version = "1.1.4"
+@@ -69,9 +63,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "anyhow"
+-version = "1.0.100"
++version = "1.0.104"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
++checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+ 
+ [[package]]
+ name = "bitflags"
+@@ -153,15 +147,6 @@ dependencies = [
+ name = "crabefi-runtime-abi"
+ version = "0.1.0"
+ 
+-[[package]]
+-name = "crc32fast"
+-version = "1.5.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+-dependencies = [
+- "cfg-if",
+-]
+-
+ [[package]]
+ name = "crypto-common"
+ version = "0.1.7"
+@@ -198,16 +183,6 @@ version = "2.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+ 
+-[[package]]
+-name = "flate2"
+-version = "1.1.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+-dependencies = [
+- "crc32fast",
+- "miniz_oxide",
+-]
+-
+ [[package]]
+ name = "generic-array"
+ version = "0.14.7"
+@@ -266,25 +241,13 @@ version = "2.7.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+ 
+-[[package]]
+-name = "miniz_oxide"
+-version = "0.8.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+-dependencies = [
+- "adler2",
+- "simd-adler32",
+-]
+-
+ [[package]]
+ name = "object"
+ version = "0.40.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+ dependencies = [
+- "flate2",
+  "memchr",
+- "ruzstd",
+ ]
+ 
+ [[package]]
+@@ -365,15 +328,6 @@ dependencies = [
+  "windows-sys",
+ ]
+ 
+-[[package]]
+-name = "ruzstd"
+-version = "0.9.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+-dependencies = [
+- "twox-hash",
+-]
+-
+ [[package]]
+ name = "serde"
+ version = "1.0.228"
+@@ -427,12 +381,6 @@ dependencies = [
+  "digest",
+ ]
+ 
+-[[package]]
+-name = "simd-adler32"
+-version = "0.3.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+-
+ [[package]]
+ name = "strsim"
+ version = "0.11.1"
+@@ -463,12 +411,6 @@ dependencies = [
+  "windows-sys",
+ ]
+ 
+-[[package]]
+-name = "twox-hash"
+-version = "2.1.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
+-
+ [[package]]
+ name = "typenum"
+ version = "1.20.1"
+diff --git a/xtask/Cargo.toml b/xtask/Cargo.toml
+index 86e609a..2996509 100644
+--- a/xtask/Cargo.toml
++++ b/xtask/Cargo.toml
+@@ -19,5 +19,7 @@ clap = { version = "4", features = ["derive"] }
+ regex = "1"
+ serde_json = "1"
+ sha2 = "0.10"
+-object = { version = "0.40.0", features = ["read_core", "elf"] }
++# Runtime packaging reads ELF sections directly; compressed debug sections
++# are unnecessary. Keep the unused compression/format parsers out of the tool.
++object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
+ tempfile = "3"

@@ -1,0 +1,520 @@
+From 1f83299f41d8fd714142a0a6c2cf79a4f1a10d61 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Thu, 15 Oct 2026 23:04:22 +0200
+Subject: [PATCH] coreboot: add locked-ro-store payload variant
+
+Split the payload's variable store into two exclusive features:
+spi-store (default, upstream behaviour) and locked-ro-store. The locked
+variant reads a pre-provisioned EDK2 store from the RO_UEFI_VARS FMAP area
+through the memory-mapped boot flash, reports it write-protected, and has
+no SPI controller or flash-write code. The store's SHA-256 is fixed at build
+time (CRABEFI_RO_VARSTORE_SHA256) and a mismatching region is refused.
+
+Payload features tpm/xhci are separate; spi-store keeps both, the locked
+variant leaves them out to minimise pre-boot attack surface.
+---
+ crabefi-coreboot/Cargo.toml      |  20 ++-
+ crabefi-coreboot/src/main.rs     |  33 +++-
+ crabefi-coreboot/src/ro_store.rs | 276 +++++++++++++++++++++++++++++++
+ xtask/src/main.rs                |   4 +-
+ 4 files changed, 328 insertions(+), 5 deletions(-)
+ create mode 100644 crabefi-coreboot/src/ro_store.rs
+
+diff --git a/crabefi-coreboot/Cargo.toml b/crabefi-coreboot/Cargo.toml
+index 315b3fe..9c3ed2f 100644
+--- a/crabefi-coreboot/Cargo.toml
++++ b/crabefi-coreboot/Cargo.toml
+@@ -7,8 +7,23 @@ repository.workspace = true
+ description = "CrabEFI as a coreboot payload binary"
+ 
+ [features]
+-default = ["bundled-runtime-image"]
++default = ["bundled-runtime-image", "spi-store"]
+ bundled-runtime-image = ["crabefi/bundled-runtime-image"]
++# Upstream behaviour: writable SPI variable store, capsule updates.
++spi-store = ["crabefi/full", "tpm", "xhci"]
++# Locked deployment: pre-provisioned, memory-mapped, read-only variable store
++# and unconditional Secure Boot. No SPI controller or flash-write code, no
++# capsule updates. TPM and xHCI are left out to keep the pre-boot attack
++# surface minimal; add `tpm` / `xhci` for boards that need measured boot or
++# USB boot media.
++# Build with `--no-default-features --features bundled-runtime-image,locked-ro-store`.
++locked-ro-store = [
++  "dep:sha2",
++  "crabefi/variable-store",
++  "crabefi/enforce-secure-boot",
++]
++tpm = ["crabefi/tpm"]
++xhci = ["crabefi/xhci"]
+ external-runtime-image = []
+ ui = ["crabefi/ui"]
+ # Fabricate a QEMU-shaped memory map when coreboot tables are missing or
+@@ -18,7 +33,6 @@ fallback-memory-map = []
+ 
+ [dependencies]
+ crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
+-  "full",
+   "global-allocator",
+   "platform-entry",
+ ] }
+@@ -27,6 +41,8 @@ log = "0.4"
+ r-efi = "7.1"
+ heapless = "0.9"
+ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
++# locked-ro-store: binds the read-only variable store to this payload build.
++sha2 = { version = "0.11", default-features = false, optional = true }
+ 
+ # ACPI table parsing and AML interpreter for platform device discovery.
+ # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
+diff --git a/crabefi-coreboot/src/main.rs b/crabefi-coreboot/src/main.rs
+index 464b5b6..c606f8d 100644
+--- a/crabefi-coreboot/src/main.rs
++++ b/crabefi-coreboot/src/main.rs
+@@ -34,16 +34,24 @@ mod arch_entry;
+ mod cbmem_console;
+ mod cfr;
+ mod cfr_menu;
++#[cfg(feature = "spi-store")]
+ mod fmap;
+ mod framebuffer;
+ mod memory;
+ mod memory_map;
++#[cfg(feature = "locked-ro-store")]
++mod ro_store;
+ #[cfg(feature = "external-runtime-image")]
+ mod runtime_blob;
+ mod tables;
+ #[cfg(target_arch = "x86_64")]
+ mod timestamps;
+ 
++#[cfg(all(feature = "spi-store", feature = "locked-ro-store"))]
++compile_error!("`spi-store` and `locked-ro-store` are mutually exclusive");
++#[cfg(not(any(feature = "spi-store", feature = "locked-ro-store")))]
++compile_error!("select a variable store: `spi-store` or `locked-ro-store`");
++
+ use core::panic::PanicInfo;
+ #[cfg(target_arch = "riscv64")]
+ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+@@ -241,6 +249,7 @@ impl crabefi::ResetHandler for CorebootReset {
+     }
+ }
+ 
++#[cfg(feature = "spi-store")]
+ /// Coreboot-backed locator for CrabEFI's persistent variable store.
+ ///
+ /// Coreboot can describe the store either directly via SMMSTORE v2 tables, or
+@@ -253,6 +262,7 @@ struct CorebootVariableStoreLocator {
+     spi_flash: Option<tables::SpiFlashInfo>,
+ }
+ 
++#[cfg(feature = "spi-store")]
+ impl CorebootVariableStoreLocator {
+     fn new(cb_info: &tables::CorebootInfo) -> Self {
+         Self {
+@@ -326,6 +336,7 @@ impl CorebootVariableStoreLocator {
+     }
+ }
+ 
++#[cfg(feature = "spi-store")]
+ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
+     fn locate_variable_store(
+         &self,
+@@ -381,6 +392,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
+     }
+ }
+ 
++#[cfg(feature = "spi-store")]
+ /// Coreboot SPI/FMAP implementation of the platform capsule backend.
+ struct CorebootCapsuleBackend {
+     firmware_info: Option<crabefi::FirmwareInfo>,
+@@ -389,6 +401,7 @@ struct CorebootCapsuleBackend {
+     fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
+ }
+ 
++#[cfg(feature = "spi-store")]
+ impl CorebootCapsuleBackend {
+     fn new(
+         firmware_info: Option<crabefi::FirmwareInfo>,
+@@ -425,6 +438,7 @@ impl CorebootCapsuleBackend {
+     }
+ }
+ 
++#[cfg(feature = "spi-store")]
+ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
+     fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
+         self.firmware_info.as_ref()
+@@ -738,6 +752,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
+         ecam_regions: &[],
+         runtime_image: runtime_image_source(),
+         runtime: runtime_platform_config(),
++        #[cfg(feature = "tpm")]
+         tpm_event_log: None,
+         heap_pre_initialized: false,
+     };
+@@ -866,6 +881,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         framebuffer::store_framebuffer_record_addr(addr);
+     }
+ 
++    #[cfg(feature = "spi-store")]
+     if let Some(ref spi_flash) = cb_info.spi_flash
+         && let Some(window) = spi_flash.mmap_windows.first()
+     {
+@@ -981,7 +997,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+ 
+     let reset = CorebootReset;
+     let hooks = CorebootHooks;
++    #[cfg(feature = "spi-store")]
+     let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
++    #[cfg(feature = "locked-ro-store")]
++    let mut ro_variable_store = ro_store::MappedReadOnlyStore::locate(&cb_info);
+     #[cfg(target_arch = "x86_64")]
+     let timestamp_recorder_ref = timestamp_recorder
+         .as_ref()
+@@ -1034,6 +1053,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         capsule_count += 1;
+     }
+ 
++    #[cfg(feature = "spi-store")]
+     let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
+ 
+     let mut config = crabefi::PlatformConfig {
+@@ -1042,7 +1062,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         timestamp_recorder: timestamp_recorder_ref,
+         reset: &reset,
+         block_devices: &mut [],
++        #[cfg(feature = "spi-store")]
+         variable_storage: crabefi::VariableStorage::Spi(&variable_store_locator),
++        // A missing store leaves no keys; `enforce-secure-boot` then halts.
++        #[cfg(feature = "locked-ro-store")]
++        variable_storage: match ro_variable_store.as_mut() {
++            Some(store) => crabefi::VariableStorage::Platform(store),
++            None => crabefi::VariableStorage::None,
++        },
+         debug_output: None, // Already set up via serial::init_from_config()
+         console_input: None,
+         framebuffer,
+@@ -1053,13 +1080,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         discover_mmio: cfg!(any(target_arch = "aarch64", target_arch = "riscv64")),
+         firmware_info,
+         capsule_regions: &capsule_regions[..capsule_count],
++        #[cfg(feature = "spi-store")]
+         capsule_backend: Some(&mut capsule_backend),
++        #[cfg(feature = "locked-ro-store")]
++        capsule_backend: None,
+         hooks: Some(&hooks),
+         rng: None,
+         ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.
+         runtime_image: runtime_image_source(),
+         runtime: runtime_platform_config(),
+         // Enable measured boot.
++        #[cfg(feature = "tpm")]
+         // If coreboot provided a standard TPM event log in CBMEM, continue
+         // using that log's protocol family. Without an existing standard log,
+         // start fresh and install both TCG protocol families for compatibility.
+@@ -1147,7 +1178,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
+         config.acpi_info = Some(acpi_info.clone());
+ 
+-        #[cfg(target_arch = "x86_64")]
++        #[cfg(all(target_arch = "x86_64", feature = "tpm"))]
+         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
+             .iter()
+             .find_map(|hid| acpi_info.find_device(hid).map(|device| (*hid, device)))
+diff --git a/crabefi-coreboot/src/ro_store.rs b/crabefi-coreboot/src/ro_store.rs
+new file mode 100644
+index 0000000..0a2b720
+--- /dev/null
++++ b/crabefi-coreboot/src/ro_store.rs
+@@ -0,0 +1,276 @@
++//! Read-only, memory-mapped UEFI variable store.
++//!
++//! Locked builds (`locked-ro-store`) keep the EDK2 variable store inside the
++//! BIOS region that coreboot write-protects before the payload runs
++//! (`BOOTMEDIA_LOCK_CONTROLLER` + `BOOTMEDIA_LOCK_WHOLE_RO`). The store is
++//! generated at ROM build time with the platform's PK, KEK, db and
++//! `SecureBootEnable=1` already in it, so CrabEFI never needs to write it.
++//!
++//! This backend therefore:
++//!
++//! * reads the region through the CPU's memory-mapped view of the boot flash
++//!   (no SPI controller driver, no write/erase code path at all);
++//! * reports itself as write-protected, so the variable layer mounts the store
++//!   read-only and never tries to format or compact it;
++//! * fails every program/erase request with `WriteProtected`.
++//!
++//! The region is found by name in the FMAP that coreboot points at through
++//! `LB_TAG_BOOT_MEDIA_PARAMS`. Its bytes are covered by the same flash
++//! protection as the rest of the ROM. In addition the payload is built with
++//! the SHA-256 of the exact store image (`CRABEFI_RO_VARSTORE_SHA256`), and a
++//! region whose contents differ is refused. That binds the key hierarchy to
++//! this payload: with coreboot's CBFS verification the payload, and through
++//! it the store, hang off the same metadata hash.
++
++use crabefi::{StorageBackend, StorageError};
++use sha2::{Digest, Sha256};
++
++use crate::tables;
++
++/// SHA-256 of the store image this payload was built for (64 hex digits).
++const EXPECTED_SHA256: &str = env!(
++    "CRABEFI_RO_VARSTORE_SHA256",
++    "locked-ro-store builds need CRABEFI_RO_VARSTORE_SHA256=<sha256 of the generated store>"
++);
++
++/// Parse [`EXPECTED_SHA256`]; a malformed value is a build error.
++const fn expected_digest() -> [u8; 32] {
++    const fn nibble(c: u8) -> u8 {
++        match c {
++            b'0'..=b'9' => c - b'0',
++            b'a'..=b'f' => c - b'a' + 10,
++            b'A'..=b'F' => c - b'A' + 10,
++            _ => panic!("CRABEFI_RO_VARSTORE_SHA256 is not hex"),
++        }
++    }
++    let hex = EXPECTED_SHA256.as_bytes();
++    assert!(
++        hex.len() == 64,
++        "CRABEFI_RO_VARSTORE_SHA256 must be 64 hex digits"
++    );
++    let mut out = [0u8; 32];
++    let mut i = 0;
++    while i < 32 {
++        out[i] = (nibble(hex[2 * i]) << 4) | nibble(hex[2 * i + 1]);
++        i += 1;
++    }
++    out
++}
++const EXPECTED_DIGEST: [u8; 32] = expected_digest();
++
++/// FMAP area name holding the pre-provisioned variable store.
++pub const REGION_NAME: &[u8] = b"RO_UEFI_VARS";
++
++const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
++/// `signature[8] ver_major ver_minor base:u64 size:u32 name[32] nareas:u16`
++const FMAP_HEADER_LEN: u64 = 56;
++/// `offset:u32 size:u32 name[32] flags:u16`
++const FMAP_AREA_LEN: u64 = 42;
++const FMAP_NAME_LEN: usize = 32;
++/// Upper bound on areas walked, so a malformed FMAP cannot stall boot.
++const FMAP_MAX_AREAS: u16 = 128;
++/// Erase-block granularity of the store layout (EDK2 FV blocks).
++const BLOCK: u32 = 4096;
++
++/// The located store: a CPU-visible, read-only window of `size` bytes.
++pub struct MappedReadOnlyStore {
++    phys_base: u64,
++    size: u32,
++}
++
++/// One CPU-visible window onto the boot flash.
++#[derive(Clone, Copy)]
++struct Window {
++    /// Physical address of flash offset `flash_base`.
++    host_base: u64,
++    /// First flash offset covered by the window.
++    flash_base: u64,
++    /// Window length.
++    size: u64,
++}
++
++/// The CPU-visible mapping of the boot flash, as described by coreboot.
++struct FlashMap {
++    windows: heapless::Vec<Window, { tables::MAX_FLASH_MMAP_WINDOWS + 1 }>,
++}
++
++impl FlashMap {
++    /// Physical address for `[offset, offset + len)`, if one window holds all of it.
++    fn phys(&self, offset: u64, len: u64) -> Option<u64> {
++        self.windows.iter().find_map(|window| {
++            let relative = offset.checked_sub(window.flash_base)?;
++            let end = relative.checked_add(len)?;
++            (end <= window.size).then(|| window.host_base + relative)
++        })
++    }
++
++    fn read(&self, offset: u64, buffer: &mut [u8]) -> Option<()> {
++        let phys = self.phys(offset, buffer.len() as u64)?;
++        read_mapped(phys, buffer);
++        Some(())
++    }
++}
++
++/// Byte-wise volatile copy out of the flash mapping.
++fn read_mapped(phys: u64, buffer: &mut [u8]) {
++    for (index, byte) in buffer.iter_mut().enumerate() {
++        // SAFETY: callers only pass ranges validated against coreboot's
++        // description of the memory-mapped boot flash, which is identity
++        // mapped by the payload entry code. Volatile byte reads keep the
++        // compiler from merging or eliding accesses to the decode window.
++        *byte = unsafe { core::ptr::read_volatile((phys + index as u64) as *const u8) };
++    }
++}
++
++fn le16(bytes: &[u8], at: usize) -> u16 {
++    u16::from_le_bytes([bytes[at], bytes[at + 1]])
++}
++
++fn le32(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
++}
++
++fn name_is(field: &[u8], wanted: &[u8]) -> bool {
++    let len = field.iter().position(|&b| b == 0).unwrap_or(field.len());
++    &field[..len] == wanted
++}
++
++/// Collect the flash mapping coreboot described. SPI flash mmap windows are
++/// exact; without them, x86 decodes the end of the boot medium just below
++/// 4 GiB.
++fn flash_map(info: &tables::CorebootInfo) -> Option<(FlashMap, u64)> {
++    let boot_media = info.boot_media?;
++    let mut windows = heapless::Vec::new();
++    if let Some(spi) = info.spi_flash.as_ref() {
++        for window in spi.mmap_windows.iter() {
++            let _ = windows.push(Window {
++                host_base: u64::from(window.host_base),
++                flash_base: u64::from(window.flash_base),
++                size: u64::from(window.size),
++            });
++        }
++    }
++    if windows.is_empty() {
++        let size = boot_media.boot_media_size;
++        let _ = windows.push(Window {
++            host_base: 0x1_0000_0000u64.checked_sub(size)?,
++            flash_base: 0,
++            size,
++        });
++    }
++    Some((FlashMap { windows }, boot_media.fmap_offset))
++}
++
++impl MappedReadOnlyStore {
++    /// Find [`REGION_NAME`] in the FMAP and check that the whole region is
++    /// readable through the flash mapping.
++    pub fn locate(info: &tables::CorebootInfo) -> Option<Self> {
++        let Some((map, fmap_offset)) = flash_map(info) else {
++            log::error!("RO varstore: coreboot did not describe the boot media mapping");
++            return None;
++        };
++
++        let mut header = [0u8; FMAP_HEADER_LEN as usize];
++        if map.read(fmap_offset, &mut header).is_none() || &header[..8] != FMAP_SIGNATURE {
++            log::error!("RO varstore: no FMAP at flash offset {:#x}", fmap_offset);
++            return None;
++        }
++        let nareas = le16(&header, 54).min(FMAP_MAX_AREAS);
++
++        for index in 0..u64::from(nareas) {
++            let mut area = [0u8; FMAP_AREA_LEN as usize];
++            let at = fmap_offset + FMAP_HEADER_LEN + index * FMAP_AREA_LEN;
++            map.read(at, &mut area)?;
++            if !name_is(&area[8..8 + FMAP_NAME_LEN], REGION_NAME) {
++                continue;
++            }
++            let offset = u64::from(le32(&area, 0));
++            let size = le32(&area, 4);
++            if size == 0 || !size.is_multiple_of(BLOCK) || !offset.is_multiple_of(u64::from(BLOCK))
++            {
++                log::error!(
++                    "RO varstore: FMAP area has unusable geometry ({:#x}+{:#x})",
++                    offset,
++                    size
++                );
++                return None;
++            }
++            let Some(phys_base) = map.phys(offset, u64::from(size)) else {
++                log::error!(
++                    "RO varstore: area {:#x}+{:#x} is outside the flash mapping",
++                    offset,
++                    size
++                );
++                return None;
++            };
++            let mut hasher = Sha256::new();
++            let mut chunk = [0u8; 512];
++            for at in (0..u64::from(size)).step_by(chunk.len()) {
++                read_mapped(phys_base + at, &mut chunk);
++                hasher.update(chunk);
++            }
++            let digest: [u8; 32] = hasher.finalize().into();
++            if digest != EXPECTED_DIGEST {
++                log::error!(
++                    "RO varstore: contents do not match the store this payload was built for \
++                     (sha256 {:02x?}..., expected {})",
++                    &digest[..8],
++                    EXPECTED_SHA256
++                );
++                return None;
++            }
++            log::info!(
++                "RO varstore: '{}' at flash {:#x} (phys {:#x}), {} KiB, read-only",
++                core::str::from_utf8(REGION_NAME).unwrap_or("?"),
++                offset,
++                phys_base,
++                size / 1024
++            );
++            return Some(Self { phys_base, size });
++        }
++
++        log::error!("RO varstore: FMAP has no RO_UEFI_VARS area");
++        None
++    }
++}
++
++impl StorageBackend for MappedReadOnlyStore {
++    fn name(&self) -> &str {
++        "RO_UEFI_VARS (mapped, read-only)"
++    }
++
++    fn size(&self) -> u32 {
++        self.size
++    }
++
++    fn program_granularity(&self) -> u32 {
++        1
++    }
++
++    fn erase_granularity(&self) -> u32 {
++        BLOCK
++    }
++
++    fn is_write_protected(&self) -> bool {
++        true
++    }
++
++    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError> {
++        let end = u64::from(offset)
++            .checked_add(buffer.len() as u64)
++            .ok_or(StorageError::InvalidArgument)?;
++        if end > u64::from(self.size) {
++            return Err(StorageError::InvalidArgument);
++        }
++        read_mapped(self.phys_base + u64::from(offset), buffer);
++        Ok(())
++    }
++
++    fn program(&mut self, _offset: u32, _data: &[u8]) -> Result<(), StorageError> {
++        Err(StorageError::WriteProtected)
++    }
++
++    fn erase(&mut self, _offset: u32, _size: u32) -> Result<(), StorageError> {
++        Err(StorageError::WriteProtected)
++    }
++}
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 53ab138..51a4495 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -405,9 +405,9 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
+         cmd.arg("--release");
+     }
+     let features = if ui {
+-        "external-runtime-image,ui"
++        "external-runtime-image,spi-store,ui"
+     } else {
+-        "external-runtime-image"
++        "external-runtime-image,spi-store"
+     };
+     cmd.arg("--features").arg(features);
+ 

@@ -1,0 +1,9 @@
+# build outputs
+/out/
+/release/
+
+# downloaded/cloned sources (coreboot, CrabEFI, keys)
+/src/
+
+# proprietary board blobs (descriptor, ME, FSP) - never commit these
+/blobs/

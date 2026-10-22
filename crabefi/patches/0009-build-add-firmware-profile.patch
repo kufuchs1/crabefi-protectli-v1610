@@ -1,0 +1,44 @@
+From 525b8913f24fe4f630ebfc4a60c8449cbfedaf8b Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Mon, 19 Oct 2026 13:03:05 +0000
+Subject: [PATCH] build: add a firmware profile with immediate-abort and
+ stripped symbols
+
+`cargo build --profile firmware` inherits the release profile (opt-level z,
+fat LTO, one codegen unit) and adds panic = "immediate-abort" and
+strip = "symbols". The x86_64 locked payload shrinks from 2,711,160 to
+2,396,952 bytes. Panics still halt: the trap reaches the IDT exception
+handler, which logs the RIP and halts, but the panic message is not printed.
+
+The profile is separate because the workspace's host tools (for example
+crabefi-varstore-gen) link the prebuilt std, which rejects immediate-abort.
+---
+ Cargo.toml | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 8c6b25e..07bf2a1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,6 @@
++# `panic = "immediate-abort"` (profile.firmware) is still unstable in Cargo.
++cargo-features = ["panic-immediate-abort"]
++
+ # Workspace: the core library and platform payloads are separate crates.
+ # xtask and test-apps are NOT workspace members (different build targets).
+ 
+@@ -50,3 +53,14 @@ panic = "abort"
+ lto = true
+ opt-level = "z"
+ codegen-units = 1
++
++# Firmware payload only: `cargo build --profile firmware`. The host tools in
++# this workspace link Rust's prebuilt std, which cannot use immediate-abort,
++# so this cannot live in profile.release. A panic becomes a trap instruction:
++# the IDT handler logs "Invalid Opcode" and the RIP, then halts (no message).
++[profile.firmware]
++inherits = "release"
++# Same as release's `lto = true` (rustc -C lto); spelled out because it matters.
++lto = "fat"
++panic = "immediate-abort"
++strip = "symbols"

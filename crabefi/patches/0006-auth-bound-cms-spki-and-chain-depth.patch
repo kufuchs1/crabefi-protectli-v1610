@@ -1,0 +1,244 @@
+From 2c524877f8c9ceab7a7c3bfc7da0c8da8c53841b Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Sun, 18 Oct 2026 17:48:48 +0000
+Subject: [PATCH] auth: bound CMS metadata and enforce SPKI and chain depth
+ policy
+
+---
+ crabefi-core/src/efi/auth/crypto.rs           | 117 +++++++++++++++++-
+ crabefi-pkcs7/src/x509.rs                     |   8 +-
+ .../tests/pkcs7_adversarial.rs                |   6 +-
+ 3 files changed, 124 insertions(+), 7 deletions(-)
+
+diff --git a/crabefi-core/src/efi/auth/crypto.rs b/crabefi-core/src/efi/auth/crypto.rs
+index 8260cd2..d6de42e 100644
+--- a/crabefi-core/src/efi/auth/crypto.rs
++++ b/crabefi-core/src/efi/auth/crypto.rs
+@@ -26,6 +26,11 @@ const RSA_LIMBS: usize = 128;
+ const MAX_RSA_MODULUS_BITS: usize = RSA_LIMBS * 64;
+ /// Largest accepted RSA public exponent (2^33 - 1).
+ const MAX_RSA_EXPONENT: u64 = (1 << 33) - 1;
++// Bound unauthenticated CMS parsing and certificate-path search.
++const MAX_PKCS7_SIZE: usize = 256 * 1024;
++const MAX_CERTIFICATE_SIZE: usize = 16 * 1024;
++const MAX_CERTIFICATES: usize = 16;
++const MAX_SIGNERS: usize = 8;
+ 
+ // ============================================================================
+ // Certificate Chain Building Configuration
+@@ -166,6 +171,9 @@ pub fn verify_pkcs7_signature_chain(
+     trusted_cert: &[u8],
+     require_detached: bool,
+ ) -> Result<Option<CertificateChain>, AuthError> {
++    if pkcs7_data.len() > MAX_PKCS7_SIZE || trusted_cert.len() > MAX_CERTIFICATE_SIZE {
++        return Err(AuthError::BufferTooSmall);
++    }
+     // WIN_CERTIFICATE is 8-byte aligned, so the parser ignores alignment
+     // padding after the ContentInfo.
+     let pkcs7 = SignedData::parse(pkcs7_data).map_err(|e| {
+@@ -181,6 +189,7 @@ pub fn verify_pkcs7_signature_chain(
+     }
+     let signers = pkcs7
+         .signers()
++        .take(MAX_SIGNERS + 1)
+         .map(|signer| {
+             let signer = signer?;
+             const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
+@@ -209,16 +218,24 @@ pub fn verify_pkcs7_signature_chain(
+             log::debug!("Failed to parse PKCS#7 SignerInfo: {:?}", e);
+             AuthError::InvalidHeader
+         })?;
++    if signers.len() > MAX_SIGNERS {
++        return Err(AuthError::BufferTooSmall);
++    }
+ 
+     // Validate the trusted certificate from db can be parsed
+     parse_cert_view(trusted_cert)?;
+ 
+     // Only plain X.509 certificates (SEQUENCE) take part in chain building.
+-    let embedded_certs: Vec<&[u8]> = pkcs7
+-        .certificates()
+-        .filter(|certificate| certificate.tag == tag::SEQUENCE)
+-        .map(|certificate| certificate.encoded)
+-        .collect();
++    let mut embedded_certs = Vec::new();
++    for certificate in pkcs7.certificates() {
++        if embedded_certs.len() >= MAX_CERTIFICATES
++            || certificate.tag != tag::SEQUENCE
++            || certificate.encoded.len() > MAX_CERTIFICATE_SIZE
++        {
++            return Err(AuthError::BufferTooSmall);
++        }
++        embedded_certs.push(certificate.encoded);
++    }
+     log::debug!(
+         "PKCS#7 contains {} embedded certificates",
+         embedded_certs.len()
+@@ -392,6 +409,9 @@ pub fn build_and_verify_chain(
+     intermediates: &[&[u8]],
+     config: &ChainBuildingConfig,
+ ) -> Result<CertificateChain, AuthError> {
++    if config.max_depth == 0 {
++        return Err(AuthError::ChainTooDeep);
++    }
+     log::debug!(
+         "Building certificate chain (max depth: {}, intermediates available: {})",
+         config.max_depth,
+@@ -422,6 +442,9 @@ pub fn build_and_verify_chain(
+     if end_entity.issuer == trust_anchor.subject
+         && verify_single_cert(end_entity_der, trust_anchor_der, config)?
+     {
++        if config.max_depth < 2 {
++            return Err(AuthError::ChainTooDeep);
++        }
+         return Ok(CertificateChain {
+             certificates: vec![end_entity_der.to_vec(), trust_anchor_der.to_vec()],
+         });
+@@ -1033,6 +1056,90 @@ mod fixture_tests {
+     const SECURITY_LEAF: &[u8] = include_bytes!("testdata/security-leaf.der");
+     const SECURITY_BAD_KU: &[u8] = include_bytes!("testdata/security-badku.der");
+ 
++    fn audit_wrap(tag: u8, value: &[u8]) -> Vec<u8> {
++        let mut result = vec![tag];
++        if value.len() < 128 {
++            result.push(value.len() as u8);
++        } else {
++            let length = value.len().to_be_bytes();
++            let length = &length[length.iter().take_while(|&&byte| byte == 0).count()..];
++            result.push(0x80 | length.len() as u8);
++            result.extend_from_slice(length);
++        }
++        result.extend_from_slice(value);
++        result
++    }
++
++    fn audit_repeat_cms_field(wanted_tag: u8, copies: usize) -> Vec<u8> {
++        let mut outer = Tlv::parse(CMS_ATTRS)
++            .unwrap()
++            .contents(tag::SEQUENCE)
++            .unwrap();
++        let oid = outer.read().unwrap();
++        let signed = outer.read().unwrap().inner().unwrap();
++        let mut fields: Vec<_> = signed
++            .contents(tag::SEQUENCE)
++            .unwrap()
++            .map(|field| field.unwrap())
++            .collect();
++        let at = fields
++            .iter()
++            .rposition(|field| field.tag == wanted_tag)
++            .unwrap();
++        let replacement = audit_wrap(wanted_tag, &fields[at].value.repeat(copies));
++        fields[at] = Tlv::parse(&replacement).unwrap();
++        let body: Vec<_> = fields
++            .iter()
++            .flat_map(|field| field.encoded.iter().copied())
++            .collect();
++        let explicit = audit_wrap(
++            tag::context_constructed(0),
++            &audit_wrap(tag::SEQUENCE, &body),
++        );
++        audit_wrap(tag::SEQUENCE, &[oid.encoded, &explicit].concat())
++    }
++
++    #[test]
++    fn audit_boot_cms_rejects_excessive_certificates() {
++        let cms = audit_repeat_cms_field(tag::context_constructed(0), 17);
++        assert!(verify_pkcs7_signature(&cms, DATA, CA, true).is_err());
++    }
++
++    #[test]
++    fn audit_boot_cms_rejects_excessive_signers() {
++        let cms = audit_repeat_cms_field(tag::SET, 9);
++        assert!(verify_pkcs7_signature(&cms, DATA, CA, true).is_err());
++    }
++
++    #[test]
++    fn audit_chain_depth_limit_applies_to_fast_paths() {
++        let config = ChainBuildingConfig {
++            max_depth: 1,
++            check_validity_period: false,
++            ..ChainBuildingConfig::default()
++        };
++        assert!(build_and_verify_chain(CA, CA, &[], &config).is_ok());
++        assert!(build_and_verify_chain(LEAF, CA, &[], &config).is_err());
++        let config = ChainBuildingConfig {
++            max_depth: 0,
++            ..config
++        };
++        assert!(build_and_verify_chain(CA, CA, &[], &config).is_err());
++    }
++
++    #[test]
++    fn audit_rsa_extraction_rejects_a_pss_restricted_spki() {
++        const RSA_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
++        let mut cert = LEAF.to_vec();
++        let at = cert
++            .windows(RSA_OID.len())
++            .position(|w| w == RSA_OID)
++            .unwrap();
++        cert[at + RSA_OID.len() - 1] = 10; // RSASSA-PSS, not rsaEncryption
++        let parsed = Certificate::parse(&cert).unwrap();
++        assert!(parsed.rsa_public_key().is_err());
++    }
++
+     #[test]
+     fn recheck_rejects_mismatched_cms_content_type() {
+         let mut cms = CMS_ATTRS.to_vec();
+diff --git a/crabefi-pkcs7/src/x509.rs b/crabefi-pkcs7/src/x509.rs
+index b1ddcaf..667fde3 100644
+--- a/crabefi-pkcs7/src/x509.rs
++++ b/crabefi-pkcs7/src/x509.rs
+@@ -26,6 +26,7 @@ pub struct Certificate<'a> {
+     pub extensions: Extensions<'a>,
+     validity: &'a [u8],
+     public_key: &'a [u8],
++    public_key_algorithm: Tlv<'a>,
+ }
+ 
+ impl<'a> Certificate<'a> {
+@@ -48,7 +49,7 @@ impl<'a> Certificate<'a> {
+         let validity = tbs_fields.read_tag(tag::SEQUENCE)?.value;
+         let subject = tbs_fields.read_tag(tag::SEQUENCE)?.encoded;
+         let mut key_info = tbs_fields.read()?.contents(tag::SEQUENCE)?;
+-        key_info.read_tag(tag::SEQUENCE)?;
++        let public_key_algorithm = key_info.read_tag(tag::SEQUENCE)?;
+         let public_key = key_info.read()?.bit_string_octets()?;
+         key_info.finish()?;
+         tbs_fields.read_optional(tag::context(1))?;
+@@ -71,6 +72,7 @@ impl<'a> Certificate<'a> {
+             extensions,
+             validity,
+             public_key,
++            public_key_algorithm,
+         })
+     }
+ 
+@@ -88,6 +90,10 @@ impl<'a> Certificate<'a> {
+ 
+     /// Decode the subject public key as a PKCS#1 `RSAPublicKey`.
+     pub fn rsa_public_key(&self) -> Result<RsaPublicKey<'a>> {
++        const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
++        if !AlgorithmIdentifier::parse(self.public_key_algorithm)?.is(RSA_ENCRYPTION) {
++            return Err(DecodeError);
++        }
+         RsaPublicKey::parse(self.public_key)
+     }
+ 
+diff --git a/crabefi-runtime-image/tests/pkcs7_adversarial.rs b/crabefi-runtime-image/tests/pkcs7_adversarial.rs
+index e53a89e..3ede049 100644
+--- a/crabefi-runtime-image/tests/pkcs7_adversarial.rs
++++ b/crabefi-runtime-image/tests/pkcs7_adversarial.rs
+@@ -111,7 +111,11 @@ fn subject_public_key(key: &rsa::RsaPublicKey) -> Vec<u8> {
+     );
+     let mut bits = vec![0];
+     bits.extend_from_slice(&key_sequence);
+-    tlv(0x30, &concat(&[tlv(0x30, &[]), tlv(0x03, &bits)]))
++    let rsa_encryption = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
++    tlv(
++        0x30,
++        &concat(&[algorithm(rsa_encryption), tlv(0x03, &bits)]),
++    )
+ }
+ 
+ fn certificate(key: &rsa::RsaPrivateKey, serial: u8, issuer: u8, subject: u8, ca: bool) -> Vec<u8> {

@@ -1,0 +1,125 @@
+From 5a95488da51d9559bd233841c87a346d24c1b8ec Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Mon, 19 Oct 2026 12:37:13 +0000
+Subject: [PATCH] coreboot: drop dead TPM-only code and unused build
+ dependencies
+
+The locked build leaves out the `tpm` feature, so the TCPA event-log
+helpers in acpi.rs were compiled but never called, and the TpmLogInfo
+address/size fields were never read. Gate the helpers on `tpm` (their only
+caller already is) and allow the unread fields when TPM is off; the CBMEM
+table parser keeps recording the log in every build.
+
+crabefi-coreboot's build.rs does not use its `cc` dependency; remove it
+and its now-unused lockfile entries.
+---
+ Cargo.lock                     | 23 -----------------------
+ crabefi-coreboot/Cargo.toml    |  1 -
+ crabefi-coreboot/src/acpi.rs   |  4 ++--
+ crabefi-coreboot/src/tables.rs |  3 +++
+ 4 files changed, 5 insertions(+), 26 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index be71435..1585463 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -69,16 +69,6 @@ version = "1.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+ 
+-[[package]]
+-name = "cc"
+-version = "1.8.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6651c9ed80effdc7db0ff72512157f901af5e3549e341e24b1dd4887d836d838"
+-dependencies = [
+- "find-msvc-tools",
+- "shlex",
+-]
+-
+ [[package]]
+ name = "cfg-if"
+ version = "1.0.4"
+@@ -145,7 +135,6 @@ name = "crabefi-coreboot"
+ version = "0.1.0"
+ dependencies = [
+  "acpi",
+- "cc",
+  "crabefi-core",
+  "crabefi-runtime-abi",
+  "fdt",
+@@ -260,12 +249,6 @@ version = "0.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
+ 
+-[[package]]
+-name = "find-msvc-tools"
+-version = "0.1.14"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+-
+ [[package]]
+ name = "generic-array"
+ version = "0.14.7"
+@@ -516,12 +499,6 @@ dependencies = [
+  "digest 0.11.3",
+ ]
+ 
+-[[package]]
+-name = "shlex"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+-
+ [[package]]
+ name = "spin"
+ version = "0.12.3"
+diff --git a/crabefi-coreboot/Cargo.toml b/crabefi-coreboot/Cargo.toml
+index 9c3ed2f..6c35df2 100644
+--- a/crabefi-coreboot/Cargo.toml
++++ b/crabefi-coreboot/Cargo.toml
+@@ -70,7 +70,6 @@ x86_64 = "0.15"
+ fdt = "0.1.5"
+ 
+ [build-dependencies]
+-cc = "1"
+ crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
+ sha2 = "0.10"
+ 
+diff --git a/crabefi-coreboot/src/acpi.rs b/crabefi-coreboot/src/acpi.rs
+index 2548adf..b7ed1e7 100644
+--- a/crabefi-coreboot/src/acpi.rs
++++ b/crabefi-coreboot/src/acpi.rs
+@@ -381,7 +381,7 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
+ /// # Safety
+ /// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
+ /// remain valid for the firmware boot-services lifetime.
+-#[cfg(target_arch = "x86_64")]
++#[cfg(all(target_arch = "x86_64", feature = "tpm"))]
+ pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
+     unsafe fn read_u32(address: u64) -> u32 {
+         unsafe { core::ptr::read_unaligned(address as *const u32) }
+@@ -446,7 +446,7 @@ pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
+     None
+ }
+ 
+-#[cfg(target_arch = "x86_64")]
++#[cfg(all(target_arch = "x86_64", feature = "tpm"))]
+ fn tcpa_log_used_length(log: &[u8]) -> Option<usize> {
+     const HEADER_SIZE: usize = 4 + 4 + 20 + 4;
+     let mut offset = 0usize;
+diff --git a/crabefi-coreboot/src/tables.rs b/crabefi-coreboot/src/tables.rs
+index b6fdd4a..b7d1999 100644
+--- a/crabefi-coreboot/src/tables.rs
++++ b/crabefi-coreboot/src/tables.rs
+@@ -467,7 +467,10 @@ pub struct CorebootInfo {
+ }
+ 
+ /// Information about a TPM event log found in CBMEM.
++///
++/// Parsed in every build; only the `tpm` feature consumes the log itself.
+ #[derive(Debug, Clone, Copy)]
++#[cfg_attr(not(feature = "tpm"), allow(dead_code))]
+ pub struct TpmLogInfo {
+     /// Physical address of the log data.
+     pub address: u64,

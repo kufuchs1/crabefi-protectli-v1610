@@ -1,0 +1,158 @@
+From c5fa66a795b6d07f7c34b89222a73fb40d933ed4 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Thu, 22 Oct 2026 21:24:02 +0000
+Subject: [PATCH] handoff: keep the GOP display controller bus-mastering
+
+disable_all_bus_mastering_for_handoff() cleared Bus Master Enable on every
+enumerated PCI device, including the integrated graphics device. The
+display engine fetches the framebuffer by DMA, so the OS inherited a GOP
+framebuffer that was no longer scanned out until its own graphics driver
+re-enabled bus mastering.
+
+The display controller (class 0x03) whose memory BAR contains the handed-off
+framebuffer now keeps bus mastering. It owns no firmware DMA buffers; every
+other device is still cleared.
+
+A coreboot framebuffer outside the x86_64 payload's 64 GiB identity map is
+ignored with an error instead of being drawn to.
+---
+ crabefi-core/src/drivers/pci/mod.rs | 67 ++++++++++++++++++++++++++++-
+ crabefi-coreboot/src/tables.rs      | 22 ++++++++++
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/crabefi-core/src/drivers/pci/mod.rs b/crabefi-core/src/drivers/pci/mod.rs
+index f91aa8c..9529cc2 100644
+--- a/crabefi-core/src/drivers/pci/mod.rs
++++ b/crabefi-core/src/drivers/pci/mod.rs
+@@ -513,7 +513,33 @@ pub fn shutdown_drivers() {
+     driver::shutdown_all();
+ }
+ 
+-/// Clear PCI Bus Master Enable on all enumerated devices.
++/// Whether `dev` is the display controller whose memory BAR contains the
++/// framebuffer `(base, size)` handed to the OS through GOP.
++fn scans_out_framebuffer(dev: &PciDevice, framebuffer: Option<(u64, u64)>) -> bool {
++    let Some((base, size)) = framebuffer else {
++        return false;
++    };
++    if dev.class_code != PCI_CLASS_DISPLAY || size == 0 {
++        return false;
++    }
++    let Some(end) = base.checked_add(size) else {
++        return false;
++    };
++    dev.bars.iter().any(|bar| {
++        matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64)
++            && bar.size != 0
++            && bar.address <= base
++            && bar
++                .address
++                .checked_add(bar.size)
++                .is_some_and(|bar_end| end <= bar_end)
++    })
++}
++
++const PCI_CLASS_DISPLAY: BaseClass = 0x03;
++
++/// Clear PCI Bus Master Enable on all enumerated devices except the display
++/// controller that scans out the GOP framebuffer.
+ ///
+ /// This is a conservative OS-handoff safety net: once ExitBootServices has
+ /// succeeded, firmware-owned DMA rings and bounce buffers are no longer owned
+@@ -524,10 +550,18 @@ pub fn disable_all_bus_mastering_for_handoff() {
+     if devices.is_empty() {
+         return;
+     }
++    let framebuffer = crate::handoff::framebuffer().map(|fb| (fb.physical_address, fb.size()));
+ 
+     let mut changed = 0usize;
+     with_access(|access| {
+         for dev in devices.iter() {
++            if scans_out_framebuffer(dev, framebuffer) {
++                log::info!(
++                    "PCI {}: bus master kept for the GOP framebuffer scanout",
++                    dev.address
++                );
++                continue;
++            }
+             let mut header = PciHeader::new(dev.address);
+             let command = header.command(access);
+             if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
+@@ -821,6 +855,37 @@ mod tests {
+         }
+     }
+ 
++    fn display_with_bar(class_code: BaseClass, address: u64, size: u64) -> PciDevice {
++        let mut dev = PciDevice::new(PciAddress::new(0, 0, 2, 0));
++        dev.class_code = class_code;
++        dev.bars[2] = PciBar {
++            bar_type: BarType::Memory64,
++            address,
++            size,
++            prefetchable: true,
++        };
++        dev
++    }
++
++    #[test]
++    fn framebuffer_owner_keeps_bus_master() {
++        let igd = display_with_bar(PCI_CLASS_DISPLAY, 0xa000_0000, 0x1000_0000);
++        assert!(scans_out_framebuffer(&igd, Some((0xa000_0000, 0x7e9000))));
++        assert!(scans_out_framebuffer(&igd, Some((0xafff_f000, 0x1000))));
++    }
++
++    #[test]
++    fn other_devices_lose_bus_master() {
++        let igd = display_with_bar(PCI_CLASS_DISPLAY, 0xa000_0000, 0x1000_0000);
++        assert!(!scans_out_framebuffer(&igd, None));
++        assert!(!scans_out_framebuffer(&igd, Some((0xa000_0000, 0))));
++        assert!(!scans_out_framebuffer(&igd, Some((0x9fff_f000, 0x2000))));
++        assert!(!scans_out_framebuffer(&igd, Some((0xafff_f000, 0x2000))));
++        assert!(!scans_out_framebuffer(&igd, Some((u64::MAX, 2))));
++        let nvme = display_with_bar(0x01, 0xa000_0000, 0x1000_0000);
++        assert!(!scans_out_framebuffer(&nvme, Some((0xa000_0000, 0x7e9000))));
++    }
++
+     #[test]
+     fn pci_types_address_and_header_parse_configuration() {
+         let address = PciAddress::new(0x12, 0x34, 0x1a, 0x5);
+diff --git a/crabefi-coreboot/src/tables.rs b/crabefi-coreboot/src/tables.rs
+index b7d1999..f02ce3b 100644
+--- a/crabefi-coreboot/src/tables.rs
++++ b/crabefi-coreboot/src/tables.rs
+@@ -931,6 +931,18 @@ fn parse_serial(record_bytes: &[u8], info: &mut CorebootInfo) {
+ /// Parse framebuffer information
+ ///
+ /// This function is safe - it uses zerocopy to parse the framebuffer struct.
++/// End of the payload's x86_64 identity map (see `arch/x86_64/entry.rs`).
++#[cfg(target_arch = "x86_64")]
++const IDENTITY_MAP_END: u64 = 64 << 30;
++#[cfg(not(target_arch = "x86_64"))]
++const IDENTITY_MAP_END: u64 = u64::MAX;
++
++fn framebuffer_is_identity_mapped(base: u64, bytes_per_line: u32, lines: u32) -> bool {
++    let size = u64::from(bytes_per_line) * u64::from(lines);
++    base.checked_add(size)
++        .is_some_and(|end| size != 0 && end <= IDENTITY_MAP_END)
++}
++
+ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
+     let Ok((fb, _)) = CbFramebuffer::read_from_prefix(record_bytes) else {
+         log::warn!("Failed to parse framebuffer record");
+@@ -949,6 +961,16 @@ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
+     let blue_mask_pos = fb.blue_mask_pos;
+     let blue_mask_size = fb.blue_mask_size;
+ 
++    if !framebuffer_is_identity_mapped(physical_address, bytes_per_line, y_resolution) {
++        log::error!(
++            "Framebuffer at {:#x} ({} lines of {} bytes) is outside the identity map; not using it",
++            physical_address,
++            y_resolution,
++            bytes_per_line
++        );
++        return;
++    }
++
+     info.framebuffer = Some(FramebufferInfo {
+         physical_address,
+         x_resolution,

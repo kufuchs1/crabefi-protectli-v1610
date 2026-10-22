@@ -1,0 +1,605 @@
+From eca5ff2e9f1e4cf1dc5cc6ca53f413065eb383a8 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Thu, 15 Oct 2026 23:04:22 +0200
+Subject: [PATCH] add crabefi-varstore-gen
+
+Host tool that builds a read-only EDK2 variable store holding PK, KEK, db
+(optional dbx) from vendor .auth files plus SecureBootEnable=1, serialized
+with CrabEFI's own EDK2 writer and re-parsed before it is written.
+---
+ Cargo.lock                       |  10 +
+ Cargo.toml                       |   1 +
+ crabefi-varstore-gen/Cargo.toml  |  13 +
+ crabefi-varstore-gen/src/main.rs | 523 +++++++++++++++++++++++++++++++
+ 4 files changed, 547 insertions(+)
+ create mode 100644 crabefi-varstore-gen/Cargo.toml
+ create mode 100644 crabefi-varstore-gen/src/main.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 14a2f9d..be71435 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -154,6 +154,7 @@ dependencies = [
+  "log",
+  "r-efi",
+  "sha2 0.10.9",
++ "sha2 0.11.0",
+  "x86_64",
+  "zerocopy",
+ ]
+@@ -184,6 +185,15 @@ dependencies = [
+  "sha2 0.10.9",
+ ]
+ 
++[[package]]
++name = "crabefi-varstore-gen"
++version = "0.1.0"
++dependencies = [
++ "crabefi-core",
++ "crabefi-efi-types",
++ "crabefi-runtime-abi",
++]
++
+ [[package]]
+ name = "crypto-common"
+ version = "0.1.7"
+diff --git a/Cargo.toml b/Cargo.toml
+index 9453ad3..8c6b25e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,6 +8,7 @@ members = [
+   "crabefi-efi-types",
+   "crabefi-pkcs7",
+   "crabefi-runtime-bundle",
++  "crabefi-varstore-gen",
+ ]
+ exclude = [
+   "xtask",
+diff --git a/crabefi-varstore-gen/Cargo.toml b/crabefi-varstore-gen/Cargo.toml
+new file mode 100644
+index 0000000..64dc725
+--- /dev/null
++++ b/crabefi-varstore-gen/Cargo.toml
+@@ -0,0 +1,13 @@
++[package]
++name = "crabefi-varstore-gen"
++version = "0.1.0"
++edition.workspace = true
++license.workspace = true
++repository.workspace = true
++description = "Build a pre-provisioned, read-only EDK2 variable store (PK/KEK/db) for locked CrabEFI ROMs"
++
++[dependencies]
++# Host build of the core library: only its pure EDK2 FV serializer/parser is used.
++crabefi = { package = "crabefi-core", path = "../crabefi-core", default-features = false }
++crabefi-efi-types = { workspace = true }
++crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
+diff --git a/crabefi-varstore-gen/src/main.rs b/crabefi-varstore-gen/src/main.rs
+new file mode 100644
+index 0000000..e815213
+--- /dev/null
++++ b/crabefi-varstore-gen/src/main.rs
+@@ -0,0 +1,523 @@
++//! Build a pre-provisioned EDK2 variable store for a locked CrabEFI ROM.
++//!
++//! The output is a raw flash region (FV header + authenticated variable store)
++//! holding exactly:
++//!
++//! * `PK`, `KEK`, `db` (and optionally `dbx`): the EFI_SIGNATURE_LIST payloads
++//!   and timestamps taken from the vendor's signed `.auth` files, i.e. the
++//!   same values an OS-side `SetVariable` enrollment of those files produces;
++//! * `SecureBootEnable = 1`.
++//!
++//! Records are serialized with CrabEFI's own EDK2 writer and the finished
++//! image is re-parsed with CrabEFI's own reader before it is written, so the
++//! firmware sees exactly what this tool checked.
++//!
++//! ```text
++//! crabefi-varstore-gen --size 0x40000 \
++//!     --pk PK.auth --kek KEK.auth --db db.auth [--dbx dbx.auth] \
++//!     --output varstore.bin
++//! ```
++
++use std::{fmt::Write as _, fs, process::ExitCode};
++
++use crabefi::efi::varstore::edk2;
++use crabefi_efi_types::secure_boot::{
++    DB_NAME, DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, EFI_GLOBAL_VARIABLE_GUID,
++    EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME, SECURE_BOOT_ENABLE_NAME,
++};
++use crabefi_runtime_abi::VariableTimestamp;
++
++const NON_VOLATILE: u32 = 0x1;
++const BOOTSERVICE_ACCESS: u32 = 0x2;
++const RUNTIME_ACCESS: u32 = 0x4;
++const TIME_BASED_AUTHENTICATED_WRITE_ACCESS: u32 = 0x20;
++/// Attributes every Secure Boot key database carries.
++const KEY_DB_ATTRS: u32 =
++    NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
++/// Matches CrabEFI's `SECURE_BOOT_ENABLE_ATTRS`.
++const SECURE_BOOT_ENABLE_ATTRS: u32 = NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS;
++
++const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
++const WIN_CERT_REVISION: u16 = 0x0200;
++const EFI_TIME_LEN: usize = 16;
++/// `dwLength:u32 wRevision:u16 wCertificateType:u16 CertType:GUID`
++const WIN_CERT_UEFI_GUID_HEADER: usize = 24;
++/// `SignatureType:GUID SignatureListSize:u32 SignatureHeaderSize:u32 SignatureSize:u32`
++const ESL_HEADER: usize = 28;
++const BLOCK: u32 = 4096;
++
++type Result<T> = std::result::Result<T, String>;
++
++/// One key database to store.
++struct KeyVariable {
++    label: &'static str,
++    guid: [u8; 16],
++    name: &'static [u16],
++    timestamp: VariableTimestamp,
++    esl: Vec<u8>,
++}
++
++fn u16_at(bytes: &[u8], at: usize) -> Result<u16> {
++    bytes
++        .get(at..at + 2)
++        .map(|b| u16::from_le_bytes([b[0], b[1]]))
++        .ok_or_else(|| "truncated".into())
++}
++
++fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
++    bytes
++        .get(at..at + 4)
++        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++        .ok_or_else(|| "truncated".into())
++}
++
++fn guid_text(guid: &[u8]) -> String {
++    let d1 = u32::from_le_bytes([guid[0], guid[1], guid[2], guid[3]]);
++    let d2 = u16::from_le_bytes([guid[4], guid[5]]);
++    let d3 = u16::from_le_bytes([guid[6], guid[7]]);
++    let mut text = format!("{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-", guid[8], guid[9]);
++    for byte in &guid[10..16] {
++        let _ = write!(text, "{byte:02x}");
++    }
++    text
++}
++
++/// Split an `EFI_VARIABLE_AUTHENTICATION_2` file into timestamp + payload.
++///
++/// The PKCS#7 signature is not re-verified here: the payload is enrolled by
++/// building it into a write-protected ROM, not through `SetVariable`. Pin the
++/// input files' hashes in the build instead.
++fn parse_auth(label: &'static str, bytes: &[u8]) -> Result<(VariableTimestamp, Vec<u8>)> {
++    let err = |msg: &str| format!("{label}: {msg}");
++    if bytes.len() < EFI_TIME_LEN + WIN_CERT_UEFI_GUID_HEADER {
++        return Err(err("file too short for EFI_VARIABLE_AUTHENTICATION_2"));
++    }
++    let timestamp = VariableTimestamp {
++        year: u16_at(bytes, 0)?,
++        month: bytes[2],
++        day: bytes[3],
++        hour: bytes[4],
++        minute: bytes[5],
++        second: bytes[6],
++        pad1: 0,
++        nanosecond: 0,
++        timezone: 0,
++        daylight: 0,
++        pad2: 0,
++    };
++    // UEFI 2.10 8.2.2: the time-based authentication timestamp must have
++    // Pad1, Nanosecond, TimeZone, Daylight and Pad2 all zero.
++    if bytes[7..EFI_TIME_LEN].iter().any(|&b| b != 0) {
++        return Err(err(
++            "timestamp has non-zero Pad1/Nanosecond/TimeZone/Daylight/Pad2",
++        ));
++    }
++    if !(1..=12).contains(&timestamp.month) || !(1..=31).contains(&timestamp.day) {
++        return Err(err("timestamp is not a valid date"));
++    }
++
++    let cert = EFI_TIME_LEN;
++    let dw_length = u32_at(bytes, cert)? as usize;
++    if u16_at(bytes, cert + 4)? != WIN_CERT_REVISION
++        || u16_at(bytes, cert + 6)? != WIN_CERT_TYPE_EFI_GUID
++        || bytes[cert + 8..cert + 24] != EFI_CERT_TYPE_PKCS7_GUID
++    {
++        return Err(err(
++            "not a WIN_CERTIFICATE_UEFI_GUID/PKCS7 authentication header",
++        ));
++    }
++    if dw_length <= WIN_CERT_UEFI_GUID_HEADER {
++        return Err(err("authentication header carries no signature"));
++    }
++    let payload_start = cert
++        .checked_add(dw_length)
++        .filter(|&end| end <= bytes.len())
++        .ok_or_else(|| err("authentication header length exceeds file"))?;
++    Ok((timestamp, bytes[payload_start..].to_vec()))
++}
++
++/// Check EFI_SIGNATURE_LIST framing and return a description of each entry.
++fn check_esl(label: &str, esl: &[u8], require_x509: bool) -> Result<Vec<String>> {
++    let err = |msg: String| format!("{label}: {msg}");
++    if esl.is_empty() {
++        return Err(err("empty signature database".into()));
++    }
++    let mut entries = Vec::new();
++    let mut at = 0usize;
++    while at < esl.len() {
++        let sig_type = esl
++            .get(at..at + 16)
++            .ok_or_else(|| err(format!("truncated list at {at:#x}")))?;
++        let list_size = u32_at(esl, at + 16).map_err(err)? as usize;
++        let header_size = u32_at(esl, at + 20).map_err(err)? as usize;
++        let sig_size = u32_at(esl, at + 24).map_err(err)? as usize;
++        let end = at
++            .checked_add(list_size)
++            .filter(|&end| end <= esl.len())
++            .ok_or_else(|| err(format!("list at {at:#x} overruns the payload")))?;
++        let body = ESL_HEADER
++            .checked_add(header_size)
++            .filter(|&b| b <= list_size)
++            .ok_or_else(|| err(format!("list at {at:#x} has a bad header size")))?;
++        if sig_size <= 16 || !(list_size - body).is_multiple_of(sig_size) || list_size == body {
++            return Err(err(format!("list at {at:#x} has a bad signature size")));
++        }
++        let is_x509 = sig_type == EFI_CERT_X509_GUID;
++        if require_x509 && !is_x509 {
++            return Err(err(format!("list at {at:#x} is not EFI_CERT_X509_GUID")));
++        }
++        let mut sig = at + body;
++        while sig < end {
++            let owner = &esl[sig..sig + 16];
++            let data = &esl[sig + 16..sig + sig_size];
++            if is_x509 && data.first() != Some(&0x30) {
++                return Err(err(format!("entry at {sig:#x} is not a DER certificate")));
++            }
++            entries.push(format!(
++                "{} owner={} {} bytes",
++                if is_x509 { "x509" } else { "sig" },
++                guid_text(owner),
++                data.len()
++            ));
++            sig += sig_size;
++        }
++        at = end;
++    }
++    Ok(entries)
++}
++
++fn terminated(name: &[u16]) -> Vec<u16> {
++    let mut out = name.to_vec();
++    out.push(0);
++    out
++}
++
++fn parse_size(text: &str) -> Result<u32> {
++    let value = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
++        Some(hex) => u32::from_str_radix(hex, 16),
++        None => text.parse(),
++    };
++    value.map_err(|e| format!("--size {text}: {e}"))
++}
++
++struct Args {
++    size: u32,
++    pk: String,
++    kek: String,
++    db: String,
++    dbx: Option<String>,
++    output: String,
++}
++
++fn parse_args() -> Result<Args> {
++    let mut size = None;
++    let (mut pk, mut kek, mut db, mut dbx, mut output) = (None, None, None, None, None);
++    let mut args = std::env::args().skip(1);
++    while let Some(flag) = args.next() {
++        let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
++        match flag.as_str() {
++            "--size" => size = Some(parse_size(&value()?)?),
++            "--pk" => pk = Some(value()?),
++            "--kek" => kek = Some(value()?),
++            "--db" => db = Some(value()?),
++            "--dbx" => dbx = Some(value()?),
++            "--output" | "-o" => output = Some(value()?),
++            "--help" | "-h" => {
++                return Err("usage: crabefi-varstore-gen --size <bytes> --pk PK.auth \
++                     --kek KEK.auth --db db.auth [--dbx dbx.auth] --output <file>"
++                    .into());
++            }
++            other => return Err(format!("unknown argument {other}")),
++        }
++    }
++    Ok(Args {
++        size: size.ok_or("--size is required")?,
++        pk: pk.ok_or("--pk is required")?,
++        kek: kek.ok_or("--kek is required")?,
++        db: db.ok_or("--db is required")?,
++        dbx,
++        output: output.ok_or("--output is required")?,
++    })
++}
++
++fn load(
++    label: &'static str,
++    path: &str,
++    guid: [u8; 16],
++    name: &'static [u16],
++) -> Result<KeyVariable> {
++    let bytes = fs::read(path).map_err(|e| format!("{label}: {path}: {e}"))?;
++    let (timestamp, esl) = parse_auth(label, &bytes)?;
++    Ok(KeyVariable {
++        label,
++        guid,
++        name,
++        timestamp,
++        esl,
++    })
++}
++
++fn build(args: &Args) -> Result<Vec<u8>> {
++    let minimum = (edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH) as u32;
++    if args.size < BLOCK || !args.size.is_multiple_of(BLOCK) {
++        return Err(format!("--size must be a non-zero multiple of {BLOCK:#x}"));
++    }
++
++    let mut keys = vec![
++        load("PK", &args.pk, EFI_GLOBAL_VARIABLE_GUID, PK_NAME)?,
++        load("KEK", &args.kek, EFI_GLOBAL_VARIABLE_GUID, KEK_NAME)?,
++        load("db", &args.db, EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME)?,
++    ];
++    if let Some(path) = &args.dbx {
++        keys.push(load(
++            "dbx",
++            path,
++            EFI_IMAGE_SECURITY_DATABASE_GUID,
++            DBX_NAME,
++        )?);
++    }
++
++    // PK must hold exactly one X.509 certificate (UEFI 2.10 32.3.1); KEK
++    // entries must be X.509 or RSA-2048; db/dbx may hold any signature type.
++    for key in &keys {
++        let entries = check_esl(key.label, &key.esl, key.label == "PK")?;
++        if key.label == "PK" && entries.len() != 1 {
++            return Err(format!(
++                "PK must contain exactly one certificate, found {}",
++                entries.len()
++            ));
++        }
++        eprintln!(
++            "{:<4} {:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z  {}",
++            key.label,
++            key.timestamp.year,
++            key.timestamp.month,
++            key.timestamp.day,
++            key.timestamp.hour,
++            key.timestamp.minute,
++            key.timestamp.second,
++            entries.join(", ")
++        );
++    }
++
++    let mut image = vec![0xFFu8; args.size as usize];
++    image[..minimum as usize].copy_from_slice(&edk2::build_fv_headers(args.size));
++    let mut write = |offset: u32, data: &[u8]| -> bool {
++        let start = offset as usize;
++        match image.get_mut(start..start + data.len()) {
++            Some(slot) => {
++                // NOR semantics: programming can only clear bits.
++                for (dst, src) in slot.iter_mut().zip(data) {
++                    *dst &= *src;
++                }
++                true
++            }
++            None => false,
++        }
++    };
++
++    let mut offset = edk2::VARIABLE_DATA_OFFSET;
++    for key in &keys {
++        offset = edk2::write_variable(
++            &mut write,
++            offset,
++            &key.guid,
++            &terminated(key.name),
++            KEY_DB_ATTRS,
++            &key.esl,
++            Some(key.timestamp),
++        )
++        .ok_or_else(|| {
++            format!(
++                "{}: does not fit in a {:#x}-byte store",
++                key.label, args.size
++            )
++        })?;
++    }
++    offset = edk2::write_variable(
++        &mut write,
++        offset,
++        &EFI_GLOBAL_VARIABLE_GUID,
++        &terminated(SECURE_BOOT_ENABLE_NAME),
++        SECURE_BOOT_ENABLE_ATTRS,
++        &[1],
++        None,
++    )
++    .ok_or("SecureBootEnable: store full")?;
++    if offset > args.size {
++        return Err("store overflow".into());
++    }
++
++    verify(&image, args.size, &keys)?;
++    eprintln!(
++        "store: {:#x} bytes, {:#x} used, {} variables",
++        args.size,
++        offset,
++        keys.len() + 1
++    );
++    Ok(image)
++}
++
++/// Re-read the finished image with CrabEFI's own parser and compare.
++fn verify(image: &[u8], size: u32, keys: &[KeyVariable]) -> Result<()> {
++    let header = &image[..edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH];
++    let validation = edk2::validate_fv(header, size);
++    if !validation.valid || !validation.auth_format {
++        return Err("self-check: CrabEFI rejects the generated FV header".into());
++    }
++    let mut read = |offset: u32, buffer: &mut [u8]| -> bool {
++        let start = offset as usize;
++        match image.get(start..start + buffer.len()) {
++            Some(src) => {
++                buffer.copy_from_slice(src);
++                true
++            }
++            None => false,
++        }
++    };
++    let vars = edk2::walk_variables(&mut read, true, validation.data_size);
++    let active: Vec<_> = vars
++        .iter()
++        .filter(|v| edk2::is_var_added(v.state))
++        .collect();
++    if active.len() != keys.len() + 1 {
++        return Err(format!(
++            "self-check: expected {} active variables, CrabEFI reads {}",
++            keys.len() + 1,
++            active.len()
++        ));
++    }
++    for key in keys {
++        let found = active
++            .iter()
++            .find(|v| v.guid == key.guid && edk2::name_matches(&v.name, key.name))
++            .ok_or_else(|| format!("self-check: {} not found", key.label))?;
++        if found.data != key.esl
++            || found.attributes != KEY_DB_ATTRS
++            || found.timestamp != Some(key.timestamp)
++        {
++            return Err(format!("self-check: {} read back differently", key.label));
++        }
++    }
++    let enable = active
++        .iter()
++        .find(|v| {
++            v.guid == EFI_GLOBAL_VARIABLE_GUID
++                && edk2::name_matches(&v.name, SECURE_BOOT_ENABLE_NAME)
++        })
++        .ok_or("self-check: SecureBootEnable not found")?;
++    if enable.data != [1] {
++        return Err("self-check: SecureBootEnable != 1".into());
++    }
++    Ok(())
++}
++
++fn main() -> ExitCode {
++    let result = parse_args().and_then(|args| {
++        let image = build(&args)?;
++        fs::write(&args.output, image).map_err(|e| format!("{}: {e}", args.output))
++    });
++    match result {
++        Ok(()) => ExitCode::SUCCESS,
++        Err(message) => {
++            eprintln!("crabefi-varstore-gen: {message}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A one-entry X.509 EFI_SIGNATURE_LIST with a fake DER body.
++    fn esl(owner: u8) -> Vec<u8> {
++        let cert = [0x30, 0x82, 0x00, 0x04, 1, 2, 3, 4];
++        let sig_size = 16 + cert.len();
++        let mut out = EFI_CERT_X509_GUID.to_vec();
++        out.extend(((ESL_HEADER + sig_size) as u32).to_le_bytes());
++        out.extend(0u32.to_le_bytes());
++        out.extend((sig_size as u32).to_le_bytes());
++        out.extend([owner; 16]);
++        out.extend(cert);
++        out
++    }
++
++    /// An EFI_VARIABLE_AUTHENTICATION_2 wrapper around `payload`.
++    fn auth(payload: &[u8]) -> Vec<u8> {
++        let mut out = vec![0u8; EFI_TIME_LEN];
++        out[0..2].copy_from_slice(&2026u16.to_le_bytes());
++        out[2] = 9;
++        out[3] = 12;
++        let signature = [0x30, 0x03, 0x02, 0x01, 0x00];
++        out.extend(((WIN_CERT_UEFI_GUID_HEADER + signature.len()) as u32).to_le_bytes());
++        out.extend(WIN_CERT_REVISION.to_le_bytes());
++        out.extend(WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
++        out.extend(EFI_CERT_TYPE_PKCS7_GUID);
++        out.extend(signature);
++        out.extend(payload);
++        out
++    }
++
++    fn write_tmp(name: &str, bytes: &[u8]) -> String {
++        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let path = std::env::temp_dir().join(format!(
++            "varstore-gen-{}-{unique}-{name}",
++            std::process::id()
++        ));
++        fs::write(&path, bytes).unwrap();
++        path.to_string_lossy().into_owned()
++    }
++
++    fn args(size: u32, pk: &[u8]) -> Args {
++        Args {
++            size,
++            pk: write_tmp("pk", pk),
++            kek: write_tmp("kek", &auth(&esl(2))),
++            db: write_tmp("db", &auth(&esl(3))),
++            dbx: None,
++            output: String::new(),
++        }
++    }
++
++    #[test]
++    fn builds_and_reads_back() {
++        let image = build(&args(0x4000, &auth(&esl(1)))).unwrap();
++        assert_eq!(image.len(), 0x4000);
++        // Untouched tail stays erased.
++        assert!(image[0x2000..].iter().all(|&b| b == 0xff));
++    }
++
++    #[test]
++    fn output_is_deterministic() {
++        let a = build(&args(0x4000, &auth(&esl(1)))).unwrap();
++        let b = build(&args(0x4000, &auth(&esl(1)))).unwrap();
++        assert_eq!(a, b);
++    }
++
++    #[test]
++    fn rejects_pk_with_two_certificates() {
++        let mut two = esl(1);
++        two.extend(esl(1));
++        assert!(build(&args(0x4000, &auth(&two))).is_err());
++    }
++
++    #[test]
++    fn rejects_raw_certificate_instead_of_auth() {
++        assert!(build(&args(0x4000, &esl(1))).is_err());
++    }
++
++    #[test]
++    fn rejects_overrunning_list() {
++        let mut bad = esl(1);
++        bad[16..20].copy_from_slice(&0x1000u32.to_le_bytes());
++        assert!(check_esl("db", &bad, true).is_err());
++    }
++
++    #[test]
++    fn rejects_store_too_small_or_unaligned() {
++        assert!(build(&args(0x1000, &auth(&esl(1)))).is_ok());
++        assert!(build(&args(0x1800, &auth(&esl(1)))).is_err());
++    }
++}
