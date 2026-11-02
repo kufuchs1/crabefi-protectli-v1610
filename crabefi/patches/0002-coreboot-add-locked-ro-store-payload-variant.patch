@@ -1,4 +1,4 @@
-From 1f83299f41d8fd714142a0a6c2cf79a4f1a10d61 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Thu, 15 Oct 2026 23:04:22 +0200
 Subject: [PATCH] coreboot: add locked-ro-store payload variant
@@ -13,15 +13,28 @@ time (CRABEFI_RO_VARSTORE_SHA256) and a mismatching region is refused.
 Payload features tpm/xhci are separate; spi-store keeps both, the locked
 variant leaves them out to minimise pre-boot attack surface.
 ---
+ Cargo.lock                       |   1 +
  crabefi-coreboot/Cargo.toml      |  20 ++-
  crabefi-coreboot/src/main.rs     |  33 +++-
  crabefi-coreboot/src/ro_store.rs | 276 +++++++++++++++++++++++++++++++
- xtask/src/main.rs                |   4 +-
- 4 files changed, 328 insertions(+), 5 deletions(-)
+ xtask/src/main.rs                |   2 +-
+ 5 files changed, 328 insertions(+), 4 deletions(-)
  create mode 100644 crabefi-coreboot/src/ro_store.rs
 
+diff --git a/Cargo.lock b/Cargo.lock
+index b121ca9..addfdd1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -158,6 +158,7 @@ dependencies = [
+  "log",
+  "r-efi",
+  "sha2 0.10.9",
++ "sha2 0.11.0",
+  "x86_64",
+  "zerocopy",
+ ]
 diff --git a/crabefi-coreboot/Cargo.toml b/crabefi-coreboot/Cargo.toml
-index 315b3fe..9c3ed2f 100644
+index 098fadb..b087fa0 100644
 --- a/crabefi-coreboot/Cargo.toml
 +++ b/crabefi-coreboot/Cargo.toml
 @@ -7,8 +7,23 @@ repository.workspace = true
@@ -47,9 +60,9 @@ index 315b3fe..9c3ed2f 100644
 +tpm = ["crabefi/tpm"]
 +xhci = ["crabefi/xhci"]
  external-runtime-image = []
- ui = ["crabefi/ui"]
- # Fabricate a QEMU-shaped memory map when coreboot tables are missing or
-@@ -18,7 +33,6 @@ fallback-memory-map = []
+ # Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
+ # default 32-bit stack-argument entry. Only supported on x86-64.
+@@ -21,7 +36,6 @@ fallback-memory-map = []
  
  [dependencies]
  crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
@@ -57,7 +70,7 @@ index 315b3fe..9c3ed2f 100644
    "global-allocator",
    "platform-entry",
  ] }
-@@ -27,6 +41,8 @@ log = "0.4"
+@@ -30,6 +44,8 @@ log = "0.4"
  r-efi = "7.1"
  heapless = "0.9"
  zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
@@ -67,7 +80,7 @@ index 315b3fe..9c3ed2f 100644
  # ACPI table parsing and AML interpreter for platform device discovery.
  # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
 diff --git a/crabefi-coreboot/src/main.rs b/crabefi-coreboot/src/main.rs
-index 464b5b6..c606f8d 100644
+index f500255..6c771b5 100644
 --- a/crabefi-coreboot/src/main.rs
 +++ b/crabefi-coreboot/src/main.rs
 @@ -34,16 +34,24 @@ mod arch_entry;
@@ -143,7 +156,7 @@ index 464b5b6..c606f8d 100644
  impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
      fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
          self.firmware_info.as_ref()
-@@ -738,6 +752,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
+@@ -739,6 +753,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
          ecam_regions: &[],
          runtime_image: runtime_image_source(),
          runtime: runtime_platform_config(),
@@ -151,7 +164,7 @@ index 464b5b6..c606f8d 100644
          tpm_event_log: None,
          heap_pre_initialized: false,
      };
-@@ -866,6 +881,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -867,6 +882,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          framebuffer::store_framebuffer_record_addr(addr);
      }
  
@@ -159,7 +172,7 @@ index 464b5b6..c606f8d 100644
      if let Some(ref spi_flash) = cb_info.spi_flash
          && let Some(window) = spi_flash.mmap_windows.first()
      {
-@@ -981,7 +997,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -982,7 +998,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
  
      let reset = CorebootReset;
      let hooks = CorebootHooks;
@@ -170,7 +183,7 @@ index 464b5b6..c606f8d 100644
      #[cfg(target_arch = "x86_64")]
      let timestamp_recorder_ref = timestamp_recorder
          .as_ref()
-@@ -1034,6 +1053,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1035,6 +1054,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          capsule_count += 1;
      }
  
@@ -178,7 +191,7 @@ index 464b5b6..c606f8d 100644
      let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
  
      let mut config = crabefi::PlatformConfig {
-@@ -1042,7 +1062,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1043,7 +1063,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          timestamp_recorder: timestamp_recorder_ref,
          reset: &reset,
          block_devices: &mut [],
@@ -192,8 +205,8 @@ index 464b5b6..c606f8d 100644
 +        },
          debug_output: None, // Already set up via serial::init_from_config()
          console_input: None,
-         framebuffer,
-@@ -1053,13 +1080,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+         peripherals: alloc::vec::Vec::new(),
+@@ -1055,13 +1082,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          discover_mmio: cfg!(any(target_arch = "aarch64", target_arch = "riscv64")),
          firmware_info,
          capsule_regions: &capsule_regions[..capsule_count],
@@ -211,9 +224,9 @@ index 464b5b6..c606f8d 100644
          // If coreboot provided a standard TPM event log in CBMEM, continue
          // using that log's protocol family. Without an existing standard log,
          // start fresh and install both TCG protocol families for compatibility.
-@@ -1147,7 +1178,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
-         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
+@@ -1156,7 +1187,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          config.acpi_info = Some(acpi_info.clone());
+         config.peripherals = peripherals;
  
 -        #[cfg(target_arch = "x86_64")]
 +        #[cfg(all(target_arch = "x86_64", feature = "tpm"))]
@@ -503,18 +516,15 @@ index 0000000..0a2b720
 +    }
 +}
 diff --git a/xtask/src/main.rs b/xtask/src/main.rs
-index 53ab138..51a4495 100644
+index eb6dfed..feb257a 100644
 --- a/xtask/src/main.rs
 +++ b/xtask/src/main.rs
-@@ -405,9 +405,9 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
+@@ -426,7 +426,7 @@ fn cmd_build_with_entry(
+     if release {
          cmd.arg("--release");
      }
-     let features = if ui {
--        "external-runtime-image,ui"
-+        "external-runtime-image,spi-store,ui"
-     } else {
--        "external-runtime-image"
-+        "external-runtime-image,spi-store"
-     };
-     cmd.arg("--features").arg(features);
- 
+-    let mut features = vec!["external-runtime-image"];
++    let mut features = vec!["external-runtime-image", "spi-store"];
+     if ui {
+         features.push("ui");
+     }

@@ -1,4 +1,4 @@
-From a11dfeb2e39023ed38ab944974bf538aa73a653c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Sun, 18 Oct 2026 17:25:57 +0000
 Subject: [PATCH] auth: bind algorithms and content; enforce image certificate

@@ -1,4 +1,4 @@
-From b89ca4e143fbe9e7788c051493e3141c04f5a02c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Thu, 15 Oct 2026 23:04:22 +0200
 Subject: [PATCH] core: add enforce-secure-boot locked policy
@@ -20,7 +20,7 @@ Secure Boot enabled.
  7 files changed, 73 insertions(+), 7 deletions(-)
 
 diff --git a/crabefi-core/Cargo.toml b/crabefi-core/Cargo.toml
-index 6b071ec..4992e25 100644
+index 015f6c7..ac2fb0f 100644
 --- a/crabefi-core/Cargo.toml
 +++ b/crabefi-core/Cargo.toml
 @@ -16,6 +16,12 @@ xhci = ["dep:xhci"]
@@ -120,7 +120,7 @@ index fe3b0dd..1290ce9 100644
 +    false
 +}
 diff --git a/crabefi-core/src/efi/boot_services/images.rs b/crabefi-core/src/efi/boot_services/images.rs
-index 26247e8..b3ae1cf 100644
+index 5925755..fac4522 100644
 --- a/crabefi-core/src/efi/boot_services/images.rs
 +++ b/crabefi-core/src/efi/boot_services/images.rs
 @@ -174,9 +174,10 @@ pub(super) extern "efiapi" fn load_image(
@@ -137,10 +137,10 @@ index 26247e8..b3ae1cf 100644
          match super::super::auth::verify_pe_image_secure_boot(data) {
              Ok(true) => {
 diff --git a/crabefi-core/src/lib.rs b/crabefi-core/src/lib.rs
-index 025f042..66b30a4 100644
+index 271eb00..f109ab0 100644
 --- a/crabefi-core/src/lib.rs
 +++ b/crabefi-core/src/lib.rs
-@@ -177,6 +177,33 @@ const fn supports_capsule_delivery(
+@@ -178,6 +178,33 @@ const fn supports_capsule_delivery(
      writable_persistence && retained_staging_ready && backend_available
  }
  
@@ -174,7 +174,7 @@ index 025f042..66b30a4 100644
  /// Common boot tail: variable persistence, Secure Boot, and boot manager.
  ///
  /// This is the shared sequence executed by both [`init_platform()`] and
-@@ -263,6 +290,9 @@ fn init_persistence_and_boot(
+@@ -264,6 +291,9 @@ fn init_persistence_and_boot(
          }
      }
  

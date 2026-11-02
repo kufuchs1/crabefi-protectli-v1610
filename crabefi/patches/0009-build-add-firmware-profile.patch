@@ -1,4 +1,4 @@
-From 525b8913f24fe4f630ebfc4a60c8449cbfedaf8b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Mon, 19 Oct 2026 13:03:05 +0000
 Subject: [PATCH] build: add a firmware profile with immediate-abort and
@@ -17,7 +17,7 @@ crabefi-varstore-gen) link the prebuilt std, which rejects immediate-abort.
  1 file changed, 14 insertions(+)
 
 diff --git a/Cargo.toml b/Cargo.toml
-index 8c6b25e..07bf2a1 100644
+index a1d2957..b0826bf 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,3 +1,6 @@
@@ -27,7 +27,7 @@ index 8c6b25e..07bf2a1 100644
  # Workspace: the core library and platform payloads are separate crates.
  # xtask and test-apps are NOT workspace members (different build targets).
  
-@@ -50,3 +53,14 @@ panic = "abort"
+@@ -51,3 +54,14 @@ panic = "abort"
  lto = true
  opt-level = "z"
  codegen-units = 1

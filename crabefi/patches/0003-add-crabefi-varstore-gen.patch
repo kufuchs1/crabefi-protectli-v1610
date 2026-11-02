@@ -1,4 +1,4 @@
-From eca5ff2e9f1e4cf1dc5cc6ca53f413065eb383a8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Thu, 15 Oct 2026 23:04:22 +0200
 Subject: [PATCH] add crabefi-varstore-gen
@@ -7,27 +7,19 @@ Host tool that builds a read-only EDK2 variable store holding PK, KEK, db
 (optional dbx) from vendor .auth files plus SecureBootEnable=1, serialized
 with CrabEFI's own EDK2 writer and re-parsed before it is written.
 ---
- Cargo.lock                       |  10 +
+ Cargo.lock                       |   9 +
  Cargo.toml                       |   1 +
  crabefi-varstore-gen/Cargo.toml  |  13 +
  crabefi-varstore-gen/src/main.rs | 523 +++++++++++++++++++++++++++++++
- 4 files changed, 547 insertions(+)
+ 4 files changed, 546 insertions(+)
  create mode 100644 crabefi-varstore-gen/Cargo.toml
  create mode 100644 crabefi-varstore-gen/src/main.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 14a2f9d..be71435 100644
+index addfdd1..907f968 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -154,6 +154,7 @@ dependencies = [
-  "log",
-  "r-efi",
-  "sha2 0.10.9",
-+ "sha2 0.11.0",
-  "x86_64",
-  "zerocopy",
- ]
-@@ -184,6 +185,15 @@ dependencies = [
+@@ -197,6 +197,15 @@ dependencies = [
   "sha2 0.10.9",
  ]
  
@@ -41,14 +33,14 @@ index 14a2f9d..be71435 100644
 +]
 +
  [[package]]
- name = "crypto-common"
- version = "0.1.7"
+ name = "critical-section"
+ version = "1.2.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 9453ad3..8c6b25e 100644
+index 268aa1a..a1d2957 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -8,6 +8,7 @@ members = [
-   "crabefi-efi-types",
+@@ -9,6 +9,7 @@ members = [
+   "crabefi-hw",
    "crabefi-pkcs7",
    "crabefi-runtime-bundle",
 +  "crabefi-varstore-gen",
