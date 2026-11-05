@@ -20,7 +20,7 @@ and its now-unused lockfile entries.
  4 files changed, 5 insertions(+), 26 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 907f968..35a3baf 100644
+index f949d0f..e86c4c4 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -69,16 +69,6 @@ version = "1.5.0"
@@ -29,9 +29,9 @@ index 907f968..35a3baf 100644
  
 -[[package]]
 -name = "cc"
--version = "1.9.0"
+-version = "1.10.0"
 -source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+-checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 -dependencies = [
 - "find-msvc-tools",
 - "shlex",

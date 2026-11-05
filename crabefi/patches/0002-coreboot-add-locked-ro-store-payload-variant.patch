@@ -12,17 +12,21 @@ time (CRABEFI_RO_VARSTORE_SHA256) and a mismatching region is refused.
 
 Payload features tpm/xhci are separate; spi-store keeps both, the locked
 variant leaves them out to minimise pre-boot attack surface.
+
+The CFR firmware-settings menu saves options as EFI variables, which the
+read-only store cannot hold, so only the spi-store variant parses CFR and
+offers the menu.
 ---
  Cargo.lock                       |   1 +
  crabefi-coreboot/Cargo.toml      |  20 ++-
- crabefi-coreboot/src/main.rs     |  33 +++-
+ crabefi-coreboot/src/main.rs     |  38 ++++-
  crabefi-coreboot/src/ro_store.rs | 276 +++++++++++++++++++++++++++++++
  xtask/src/main.rs                |   2 +-
- 5 files changed, 328 insertions(+), 4 deletions(-)
+ 5 files changed, 333 insertions(+), 4 deletions(-)
  create mode 100644 crabefi-coreboot/src/ro_store.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index b121ca9..addfdd1 100644
+index 93e7361..3390b2c 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -158,6 +158,7 @@ dependencies = [
@@ -80,13 +84,13 @@ index 098fadb..b087fa0 100644
  # ACPI table parsing and AML interpreter for platform device discovery.
  # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
 diff --git a/crabefi-coreboot/src/main.rs b/crabefi-coreboot/src/main.rs
-index f500255..6c771b5 100644
+index b7b671f..47824f0 100644
 --- a/crabefi-coreboot/src/main.rs
 +++ b/crabefi-coreboot/src/main.rs
-@@ -34,16 +34,24 @@ mod arch_entry;
+@@ -32,16 +32,24 @@ mod arch_entry;
+ #[path = "arch/x86_64/entry.rs"]
+ mod arch_entry;
  mod cbmem_console;
- mod cfr;
- mod cfr_menu;
 +#[cfg(feature = "spi-store")]
  mod fmap;
  mod framebuffer;
@@ -108,7 +112,22 @@ index f500255..6c771b5 100644
  use core::panic::PanicInfo;
  #[cfg(target_arch = "riscv64")]
  use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-@@ -241,6 +249,7 @@ impl crabefi::ResetHandler for CorebootReset {
+@@ -202,10 +210,14 @@ impl crabefi::PlatformHooks for CorebootHooks {
+         cbmem_console::disable();
+     }
+ 
++    // The CFR settings menu writes options as EFI variables; a read-only
++    // store keeps the trait's "no settings UI" defaults instead.
++    #[cfg(feature = "spi-store")]
+     fn firmware_settings_available(&self) -> bool {
+         true
+     }
+ 
++    #[cfg(feature = "spi-store")]
+     fn show_firmware_settings(&self) -> bool {
+         crabefi::cfr_menu::show_cfr_menu();
+         true
+@@ -239,6 +251,7 @@ impl crabefi::ResetHandler for CorebootReset {
      }
  }
  
@@ -116,7 +135,7 @@ index f500255..6c771b5 100644
  /// Coreboot-backed locator for CrabEFI's persistent variable store.
  ///
  /// Coreboot can describe the store either directly via SMMSTORE v2 tables, or
-@@ -253,6 +262,7 @@ struct CorebootVariableStoreLocator {
+@@ -251,6 +264,7 @@ struct CorebootVariableStoreLocator {
      spi_flash: Option<tables::SpiFlashInfo>,
  }
  
@@ -124,7 +143,7 @@ index f500255..6c771b5 100644
  impl CorebootVariableStoreLocator {
      fn new(cb_info: &tables::CorebootInfo) -> Self {
          Self {
-@@ -326,6 +336,7 @@ impl CorebootVariableStoreLocator {
+@@ -324,6 +338,7 @@ impl CorebootVariableStoreLocator {
      }
  }
  
@@ -132,7 +151,7 @@ index f500255..6c771b5 100644
  impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
      fn locate_variable_store(
          &self,
-@@ -381,6 +392,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
+@@ -379,6 +394,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
      }
  }
  
@@ -140,7 +159,7 @@ index f500255..6c771b5 100644
  /// Coreboot SPI/FMAP implementation of the platform capsule backend.
  struct CorebootCapsuleBackend {
      firmware_info: Option<crabefi::FirmwareInfo>,
-@@ -389,6 +401,7 @@ struct CorebootCapsuleBackend {
+@@ -387,6 +403,7 @@ struct CorebootCapsuleBackend {
      fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
  }
  
@@ -148,7 +167,7 @@ index f500255..6c771b5 100644
  impl CorebootCapsuleBackend {
      fn new(
          firmware_info: Option<crabefi::FirmwareInfo>,
-@@ -425,6 +438,7 @@ impl CorebootCapsuleBackend {
+@@ -423,6 +440,7 @@ impl CorebootCapsuleBackend {
      }
  }
  
@@ -156,7 +175,7 @@ index f500255..6c771b5 100644
  impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
      fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
          self.firmware_info.as_ref()
-@@ -739,6 +753,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
+@@ -737,6 +755,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
          ecam_regions: &[],
          runtime_image: runtime_image_source(),
          runtime: runtime_platform_config(),
@@ -164,7 +183,7 @@ index f500255..6c771b5 100644
          tpm_event_log: None,
          heap_pre_initialized: false,
      };
-@@ -867,6 +882,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -865,6 +884,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          framebuffer::store_framebuffer_record_addr(addr);
      }
  
@@ -172,7 +191,7 @@ index f500255..6c771b5 100644
      if let Some(ref spi_flash) = cb_info.spi_flash
          && let Some(window) = spi_flash.mmap_windows.first()
      {
-@@ -982,7 +998,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -980,7 +1000,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
  
      let reset = CorebootReset;
      let hooks = CorebootHooks;
@@ -183,7 +202,7 @@ index f500255..6c771b5 100644
      #[cfg(target_arch = "x86_64")]
      let timestamp_recorder_ref = timestamp_recorder
          .as_ref()
-@@ -1035,6 +1054,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1033,6 +1056,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          capsule_count += 1;
      }
  
@@ -191,7 +210,7 @@ index f500255..6c771b5 100644
      let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
  
      let mut config = crabefi::PlatformConfig {
-@@ -1043,7 +1063,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1041,7 +1065,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          timestamp_recorder: timestamp_recorder_ref,
          reset: &reset,
          block_devices: &mut [],
@@ -206,7 +225,7 @@ index f500255..6c771b5 100644
          debug_output: None, // Already set up via serial::init_from_config()
          console_input: None,
          peripherals: alloc::vec::Vec::new(),
-@@ -1055,13 +1082,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1053,13 +1084,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          discover_mmio: cfg!(any(target_arch = "aarch64", target_arch = "riscv64")),
          firmware_info,
          capsule_regions: &capsule_regions[..capsule_count],
@@ -224,7 +243,7 @@ index f500255..6c771b5 100644
          // If coreboot provided a standard TPM event log in CBMEM, continue
          // using that log's protocol family. Without an existing standard log,
          // start fresh and install both TCG protocol families for compatibility.
-@@ -1156,7 +1187,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+@@ -1154,7 +1189,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
          config.acpi_info = Some(acpi_info.clone());
          config.peripherals = peripherals;
  
@@ -233,6 +252,14 @@ index f500255..6c771b5 100644
          if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
              .iter()
              .find_map(|hid| acpi_info.find_device(hid).map(|device| (*hid, device)))
+@@ -1196,6 +1231,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+     //
+     // Parse coreboot firmware configuration options now that the heap is
+     // available. cb_info.cfr_raw is still in scope — no static needed.
++    #[cfg(feature = "spi-store")]
+     if let Some(cfr_raw) = cb_info.cfr_raw
+         && let Some(cfr) = crabefi::cfr::parse_cfr(cfr_raw)
+     {
 diff --git a/crabefi-coreboot/src/ro_store.rs b/crabefi-coreboot/src/ro_store.rs
 new file mode 100644
 index 0000000..0a2b720

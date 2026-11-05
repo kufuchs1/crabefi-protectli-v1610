@@ -16,7 +16,7 @@ with CrabEFI's own EDK2 writer and re-parsed before it is written.
  create mode 100644 crabefi-varstore-gen/src/main.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index addfdd1..907f968 100644
+index 3390b2c..f949d0f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -197,6 +197,15 @@ dependencies = [
