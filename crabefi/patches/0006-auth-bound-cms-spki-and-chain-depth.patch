@@ -1,4 +1,4 @@
-From 2c524877f8c9ceab7a7c3bfc7da0c8da8c53841b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Sun, 18 Oct 2026 17:48:48 +0000
 Subject: [PATCH] auth: bound CMS metadata and enforce SPKI and chain depth

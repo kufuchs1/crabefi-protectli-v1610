@@ -1,4 +1,4 @@
-From b89ca4e143fbe9e7788c051493e3141c04f5a02c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Thu, 15 Oct 2026 23:04:22 +0200
 Subject: [PATCH] core: add enforce-secure-boot locked policy
@@ -9,18 +9,23 @@ Default Microsoft keys are never auto-enrolled, disabling Secure Boot and
 clearing keys are refused, the Secure Boot setup menu is compiled out, and
 boot halts unless the persisted PK puts the platform in User Mode with
 Secure Boot enabled.
+
+The setup-only PK deletion behind clear-all also refuses in this build, so
+no future caller can reach it, and turning the SecureBootEnable preference
+off (directly or through the toggle) fails with ACCESS_DENIED.
 ---
  crabefi-core/Cargo.toml                      |  6 ++++
  crabefi-core/src/boot_manager.rs             |  2 +-
  crabefi-core/src/efi/auth/boot.rs            | 11 +++++--
  crabefi-core/src/efi/auth/mod.rs             | 19 +++++++++++++
  crabefi-core/src/efi/boot_services/images.rs |  5 ++--
+ crabefi-core/src/efi/runtime_image/bridge.rs |  8 ++++--
  crabefi-core/src/lib.rs                      | 30 ++++++++++++++++++++
  crabefi-core/src/menu.rs                     |  7 +++--
- 7 files changed, 73 insertions(+), 7 deletions(-)
+ 8 files changed, 79 insertions(+), 9 deletions(-)
 
 diff --git a/crabefi-core/Cargo.toml b/crabefi-core/Cargo.toml
-index 6b071ec..4992e25 100644
+index 1016e43..609f2c6 100644
 --- a/crabefi-core/Cargo.toml
 +++ b/crabefi-core/Cargo.toml
 @@ -16,6 +16,12 @@ xhci = ["dep:xhci"]
@@ -37,10 +42,10 @@ index 6b071ec..4992e25 100644
  capsule-update = ["pkcs7", "variable-store"]
  # Shared verification implementation, not a runtime policy switch.
 diff --git a/crabefi-core/src/boot_manager.rs b/crabefi-core/src/boot_manager.rs
-index 4f04237..cdde2c7 100644
+index 98f0824..4c2f0ee 100644
 --- a/crabefi-core/src/boot_manager.rs
 +++ b/crabefi-core/src/boot_manager.rs
-@@ -420,7 +420,7 @@ fn boot_linux_entry(
+@@ -464,7 +464,7 @@ fn boot_linux_entry(
      // when Secure Boot is active (filtered in scan_partition_for_entries), but
      // check here as well in case an entry somehow makes it through.
      // Direct boot bypasses signature verification which violates Secure Boot.
@@ -50,7 +55,7 @@ index 4f04237..cdde2c7 100644
          log::info!("Falling back to UEFI boot path for secure verification");
          // Fall back to UEFI boot which will verify the bootloader signature
 diff --git a/crabefi-core/src/efi/auth/boot.rs b/crabefi-core/src/efi/auth/boot.rs
-index 1d57dfb..d9ebf75 100644
+index 75b127c..dcc8c03 100644
 --- a/crabefi-core/src/efi/auth/boot.rs
 +++ b/crabefi-core/src/efi/auth/boot.rs
 @@ -78,8 +78,11 @@ pub struct SecureBootConfig {
@@ -67,7 +72,7 @@ index 1d57dfb..d9ebf75 100644
          }
      }
  }
-@@ -552,6 +555,10 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
+@@ -556,6 +559,10 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
  /// After clearing, the system returns to Setup Mode and Secure Boot
  /// is disabled.
  pub fn clear_all_keys() -> Result<(), AuthError> {
@@ -77,13 +82,13 @@ index 1d57dfb..d9ebf75 100644
 +    }
      log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
  
-     // Public SetVariable correctly rejects an unsigned PK deletion in User
+     // Record the user's clear intent durably before deleting any keys. If
 diff --git a/crabefi-core/src/efi/auth/mod.rs b/crabefi-core/src/efi/auth/mod.rs
-index fe3b0dd..1290ce9 100644
+index 813b7f0..c5240f6 100644
 --- a/crabefi-core/src/efi/auth/mod.rs
 +++ b/crabefi-core/src/efi/auth/mod.rs
-@@ -156,6 +156,15 @@ pub fn is_secure_boot_enabled() -> bool {
-         == Some(1)
+@@ -197,6 +197,15 @@ pub fn toggle_secure_boot() -> Result<SecureBootState, r_efi::efi::Status> {
+     Ok(secure_boot_state())
  }
  
 +/// Whether image verification is mandatory for this boot.
@@ -98,18 +103,18 @@ index fe3b0dd..1290ce9 100644
  /// Verify a PE image after refreshing disposable boot-only key caches through
  /// the standard Runtime Services GetVariable entry point.
  #[cfg(feature = "secure-boot")]
-@@ -193,6 +202,10 @@ pub fn enable_secure_boot() {
- /// Disable Secure Boot.
+@@ -238,6 +247,10 @@ pub fn enable_secure_boot() -> Result<(), r_efi::efi::Status> {
+ /// Disable the saved preference and enforcement.
  #[cfg(feature = "secure-boot")]
- pub fn disable_secure_boot() {
+ pub fn disable_secure_boot() -> Result<(), r_efi::efi::Status> {
 +    if cfg!(feature = "enforce-secure-boot") {
 +        log::error!("Secure Boot: disabling is not permitted in this firmware build");
-+        return;
++        return Err(r_efi::efi::Status::ACCESS_DENIED);
 +    }
-     persist_secure_boot_enable_preference(false);
-     if !is_secure_boot_enabled() {
-         log::info!("Secure Boot: Disabled");
-@@ -310,3 +323,9 @@ impl From<AuthError> for r_efi::efi::Status {
+     let status = persist_secure_boot_enable_preference(false);
+     if status != r_efi::efi::Status::SUCCESS {
+         return Err(status);
+@@ -358,3 +371,9 @@ impl From<AuthError> for r_efi::efi::Status {
  pub fn is_secure_boot_enabled() -> bool {
      false
  }
@@ -120,7 +125,7 @@ index fe3b0dd..1290ce9 100644
 +    false
 +}
 diff --git a/crabefi-core/src/efi/boot_services/images.rs b/crabefi-core/src/efi/boot_services/images.rs
-index 26247e8..b3ae1cf 100644
+index 5925755..fac4522 100644
 --- a/crabefi-core/src/efi/boot_services/images.rs
 +++ b/crabefi-core/src/efi/boot_services/images.rs
 @@ -174,9 +174,10 @@ pub(super) extern "efiapi" fn load_image(
@@ -136,11 +141,32 @@ index 26247e8..b3ae1cf 100644
          log::debug!("BS.LoadImage: Secure Boot verification required");
          match super::super::auth::verify_pe_image_secure_boot(data) {
              Ok(true) => {
+diff --git a/crabefi-core/src/efi/runtime_image/bridge.rs b/crabefi-core/src/efi/runtime_image/bridge.rs
+index 069a55d..04e7379 100644
+--- a/crabefi-core/src/efi/runtime_image/bridge.rs
++++ b/crabefi-core/src/efi/runtime_image/bridge.rs
+@@ -18,10 +18,14 @@ static SETUP_PK_DELETE_ACTIVE: crate::cell::LocalCell<bool> = crate::cell::Local
+ /// public UEFI service can grant this authorization, and it is never retained.
+ #[cfg(feature = "secure-boot")]
+ pub(crate) fn delete_pk_from_setup() -> Status {
+-    #[cfg(not(feature = "variable-store"))]
++    // A locked build never removes its platform key, whoever asks.
++    #[cfg(feature = "enforce-secure-boot")]
++    return Status::ACCESS_DENIED;
++
++    #[cfg(all(not(feature = "enforce-secure-boot"), not(feature = "variable-store")))]
+     return Status::UNSUPPORTED;
+ 
+-    #[cfg(feature = "variable-store")]
++    #[cfg(all(not(feature = "enforce-secure-boot"), feature = "variable-store"))]
+     {
+         if SETUP_PK_DELETE_ACTIVE.get() {
+             return Status::ACCESS_DENIED;
 diff --git a/crabefi-core/src/lib.rs b/crabefi-core/src/lib.rs
-index 025f042..66b30a4 100644
+index ea83150..d73d32c 100644
 --- a/crabefi-core/src/lib.rs
 +++ b/crabefi-core/src/lib.rs
-@@ -177,6 +177,33 @@ const fn supports_capsule_delivery(
+@@ -182,6 +182,33 @@ const fn supports_capsule_delivery(
      writable_persistence && retained_staging_ready && backend_available
  }
  
@@ -174,7 +200,7 @@ index 025f042..66b30a4 100644
  /// Common boot tail: variable persistence, Secure Boot, and boot manager.
  ///
  /// This is the shared sequence executed by both [`init_platform()`] and
-@@ -263,6 +290,9 @@ fn init_persistence_and_boot(
+@@ -268,6 +295,9 @@ fn init_persistence_and_boot(
          }
      }
  

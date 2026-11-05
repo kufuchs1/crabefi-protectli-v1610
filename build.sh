@@ -55,7 +55,10 @@ BLOBS=(descriptor.bin me.bin fspm.bin fsps.bin)
 
 download_blobs() {  # <dir>; current blobs from the private repo
     [ -n "${BLOB_TOKEN:-}" ] || { echo "BLOB_TOKEN not set" >&2; return 1; }
-    curl -sSf --retry 3 -H "Authorization: token ${BLOB_TOKEN}" "$BLOBS_ARCHIVE_URL" \
+    # The header comes from stdin (printf is a builtin) so the token never
+    # appears in curl's argv, which other processes on the runner can read.
+    printf 'Authorization: token %s\n' "$BLOB_TOKEN" \
+        | curl -sSf --proto '=https' --retry 3 -H @- "$BLOBS_ARCHIVE_URL" \
         | tar xz -C "$1" --strip-components=4 coreboot-blobs/mainboard/protectli/V1610 \
         || return 1
     local f
@@ -199,6 +202,11 @@ prepare_keys() {
     log "Secure Boot keys from $(cat "$tmp/SOURCE")"
     python3 -I "$ROOT/tools/verify-auth-chain.py" "$tmp" \
         || { rm -rf "$tmp"; die "secureblue PK/KEK/db do not form one signed PK->KEK->db hierarchy"; }
+    # The chain check proves KEK and db were signed by the fetched PK; only
+    # this pin proves the PK is secureblue's and not one served in its place.
+    local pk; pk="$(cert_fingerprint "$tmp/PK.pem")"
+    [ "$pk" = "$SECUREBLUE_PK_SHA256" ] \
+        || { rm -rf "$tmp"; die "secureblue PK fingerprint $pk does not match SECUREBLUE_PK_SHA256 in versions.env"; }
     rm -rf "$CRABEFI_KEYS"
     mkdir -p "$(dirname "$CRABEFI_KEYS")"
     mv "$tmp" "$CRABEFI_KEYS"

@@ -53,7 +53,7 @@ Coreboot always uses the current remote `main` from
 `https://codeberg.org/kurtfuchs/coreboot.git`. There is no fixed coreboot commit
 or fallback to a stale offline checkout. The SDK tracks the newest
 `docker.io/coreboot/coreboot-sdk:testing` image. CrabEFI uses an exact upstream
-revision plus the ten checked-in patches; there is no maintained fork
+revision plus the eleven checked-in patches; there is no maintained fork
 requirement.
 
 `coreboot.txt` is the complete CrabEFI board configuration, with only `@ROOT@`
@@ -119,9 +119,12 @@ from secureblue's `uki/keys/` (the same files its `:uki` image ships in
 recorded as `secureblue_keys` with the certificate fingerprints in
 `crabefi-buildinfo.txt`. There is no local copy: if GitHub is unreachable, the
 build fails. Their authenticated updates and certificate hierarchy are verified
-before generating the 64 KiB store. The
-payload contains its SHA-256, reads it through the memory-mapped flash window,
-and refuses to boot with a foreign, corrupt or erased store. Secure Boot cannot
+before generating the 64 KiB store, and the PK must match
+`SECUREBLUE_PK_SHA256` in `versions.env`: KEK and db rotations signed by that
+PK are picked up automatically, a new PK needs a reviewed update of the pin.
+The payload contains the store's SHA-256, copies it once from the
+memory-mapped flash window into RAM, checks and uses only that copy, and
+refuses to boot with a foreign, corrupt or erased store. Secure Boot cannot
 be disabled through variables or the menu. Writable SPI storage, capsule
 updates, xHCI and TPM support are excluded from this payload variant.
 

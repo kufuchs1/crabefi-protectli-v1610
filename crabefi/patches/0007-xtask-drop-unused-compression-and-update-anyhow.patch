@@ -1,4 +1,4 @@
-From 42dd9494f611b4f007c88d558a1cdfa28901ea54 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Sun, 18 Oct 2026 17:48:48 +0000
 Subject: [PATCH] xtask: remove unused compression parsers and update anyhow

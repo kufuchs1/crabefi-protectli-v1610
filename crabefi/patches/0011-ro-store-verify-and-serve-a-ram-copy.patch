@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kurt Fuchs <contact@fuchskurt.eu>
+Date: Mon, 2 Nov 2026 00:30:39 +0000
+Subject: [PATCH] ro-store: verify and serve one RAM copy of the store
+
+The store was hashed through the memory-mapped flash window at locate time,
+and every later variable read went back to flash. A device or bus that
+answers a second read differently (an SPI interposer, or any flash writer
+the lock does not cover) could pass the digest check and then hand the
+variable layer other contents.
+
+Copy the region into a .bss buffer once, hash that copy and serve every
+read from it, so the variable layer sees only verified bytes. The heap does
+not exist yet when the store is located, hence the static buffer; it holds
+up to 256 KiB and is handed out exactly once.
+---
+ crabefi-coreboot/src/ro_store.rs | 67 +++++++++++++++++++++++---------
+ 1 file changed, 48 insertions(+), 19 deletions(-)
+
+diff --git a/crabefi-coreboot/src/ro_store.rs b/crabefi-coreboot/src/ro_store.rs
+index 0a2b720..235635a 100644
+--- a/crabefi-coreboot/src/ro_store.rs
++++ b/crabefi-coreboot/src/ro_store.rs
+@@ -8,8 +8,10 @@
+ //!
+ //! This backend therefore:
+ //!
+-//! * reads the region through the CPU's memory-mapped view of the boot flash
+-//!   (no SPI controller driver, no write/erase code path at all);
++//! * reads the region once through the CPU's memory-mapped view of the boot
++//!   flash (no SPI controller driver, no write/erase code path at all) into a
++//!   RAM copy, checks that copy and serves every later read from it, so the
++//!   variable layer only ever sees the bytes that were verified;
+ //! * reports itself as write-protected, so the variable layer mounts the store
+ //!   read-only and never tries to format or compact it;
+ //! * fails every program/erase request with `WriteProtected`.
+@@ -22,6 +24,8 @@
+ //! this payload: with coreboot's CBFS verification the payload, and through
+ //! it the store, hang off the same metadata hash.
+ 
++use core::sync::atomic::{AtomicBool, Ordering};
++
+ use crabefi::{StorageBackend, StorageError};
+ use sha2::{Digest, Sha256};
+ 
+@@ -72,10 +76,18 @@ const FMAP_MAX_AREAS: u16 = 128;
+ /// Erase-block granularity of the store layout (EDK2 FV blocks).
+ const BLOCK: u32 = 4096;
+ 
+-/// The located store: a CPU-visible, read-only window of `size` bytes.
++/// Largest store the RAM copy holds (the V1610 layout uses 64 KiB).
++const MAX_STORE: usize = 0x40000;
++
++/// RAM copy of the verified store. `locate()` runs before the payload heap
++/// exists, so the copy lives in .bss.
++static mut STORE_COPY: [u8; MAX_STORE] = [0; MAX_STORE];
++/// Set once `STORE_COPY` has been handed out, so it is never aliased.
++static STORE_COPY_TAKEN: AtomicBool = AtomicBool::new(false);
++
++/// The located store: a verified RAM copy of the read-only flash region.
+ pub struct MappedReadOnlyStore {
+-    phys_base: u64,
+-    size: u32,
++    data: &'static [u8],
+ }
+ 
+ /// One CPU-visible window onto the boot flash.
+@@ -203,13 +215,30 @@ impl MappedReadOnlyStore {
+                 );
+                 return None;
+             };
+-            let mut hasher = Sha256::new();
+-            let mut chunk = [0u8; 512];
+-            for at in (0..u64::from(size)).step_by(chunk.len()) {
+-                read_mapped(phys_base + at, &mut chunk);
+-                hasher.update(chunk);
++            let len = size as usize;
++            if len > MAX_STORE {
++                log::error!(
++                    "RO varstore: area of {:#x} bytes exceeds the {:#x}-byte RAM copy",
++                    size,
++                    MAX_STORE
++                );
++                return None;
++            }
++            if STORE_COPY_TAKEN.swap(true, Ordering::AcqRel) {
++                log::error!("RO varstore: store already located");
++                return None;
+             }
+-            let digest: [u8; 32] = hasher.finalize().into();
++            // SAFETY: the flag above hands out the static buffer exactly once,
++            // and `len <= MAX_STORE`. `&raw mut` creates no reference to the
++            // `static mut` itself.
++            let data: &'static mut [u8] = unsafe {
++                core::slice::from_raw_parts_mut((&raw mut STORE_COPY).cast::<u8>(), len)
++            };
++            // Copy once, then hash and use only the copy: a flash device or
++            // bus that answers differently on a second read cannot swap the
++            // verified contents for others.
++            read_mapped(phys_base, data);
++            let digest: [u8; 32] = Sha256::digest(&*data).into();
+             if digest != EXPECTED_DIGEST {
+                 log::error!(
+                     "RO varstore: contents do not match the store this payload was built for \
+@@ -226,7 +255,7 @@ impl MappedReadOnlyStore {
+                 phys_base,
+                 size / 1024
+             );
+-            return Some(Self { phys_base, size });
++            return Some(Self { data });
+         }
+ 
+         log::error!("RO varstore: FMAP has no RO_UEFI_VARS area");
+@@ -240,7 +269,8 @@ impl StorageBackend for MappedReadOnlyStore {
+     }
+ 
+     fn size(&self) -> u32 {
+-        self.size
++        // `locate()` bounds the length by a `u32` FMAP size.
++        self.data.len() as u32
+     }
+ 
+     fn program_granularity(&self) -> u32 {
+@@ -256,13 +286,12 @@ impl StorageBackend for MappedReadOnlyStore {
+     }
+ 
+     fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError> {
+-        let end = u64::from(offset)
+-            .checked_add(buffer.len() as u64)
++        let start = offset as usize;
++        let source = start
++            .checked_add(buffer.len())
++            .and_then(|end| self.data.get(start..end))
+             .ok_or(StorageError::InvalidArgument)?;
+-        if end > u64::from(self.size) {
+-            return Err(StorageError::InvalidArgument);
+-        }
+-        read_mapped(self.phys_base + u64::from(offset), buffer);
++        buffer.copy_from_slice(source);
+         Ok(())
+     }
+ 

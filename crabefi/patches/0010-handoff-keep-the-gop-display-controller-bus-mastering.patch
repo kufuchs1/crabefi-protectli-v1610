@@ -1,4 +1,4 @@
-From c5fa66a795b6d07f7c34b89222a73fb40d933ed4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kurt Fuchs <contact@fuchskurt.eu>
 Date: Thu, 22 Oct 2026 21:24:02 +0000
 Subject: [PATCH] handoff: keep the GOP display controller bus-mastering
